@@ -99,7 +99,7 @@ function cellBadge(c, key) {
   if (!c || !c.code || c.code < 400) return '';
   if (c.cfRay)
     return ' <span class="cfbadge" title="ошибку отдал фронт CloudFlare (cf-ray есть) — отсечение на CDN, VPN жив">CF</span>';
-  if (key.startsWith('daemon:') || key === 'local-browser')
+  if (key.startsWith('daemon:') || key.startsWith('gp:') || key === 'local-browser')
     return ' <span class="orgbadge" title="ошибку отдал сам сайт (ориджин) — cf-ray не выставлен">сайт</span>';
   return '';
 }
@@ -119,10 +119,12 @@ function startRunIndicator(label) {
   runTick = setInterval(() => {
     const el = document.getElementById('lastAction');
     if (el) el.textContent = `${SPIN_CHARS[spinIdx++ % SPIN_CHARS.length]} ${label} — идёт проверка, ${((Date.now() - t0) / 1000).toFixed(0)} с…`;
+    document.title = `⏳ ${((Date.now() - t0) / 1000).toFixed(0)} с · GeoCheck`;
   }, 250);
 }
 function stopRunIndicator() {
   if (runTick) { clearInterval(runTick); runTick = null; }
+  document.title = 'GeoCheck';
 }
 function log(msg, cls = '') {
   const el = document.getElementById('log');
@@ -728,10 +730,11 @@ function pollCheckHost(id) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function gpStart(domain) {
+async function gpStart(domain, locations) {
   const u = new URL(domain);
   const body = JSON.stringify({
     type: 'http', target: u.hostname, limit: 24,
+    ...(locations ? { locations } : {}),
     measurementOptions: { protocol: 'HTTPS', request: { method: 'GET', path: u.pathname || '/', headers: {} } },
   });
   // 429 у GlobalPing — обычное дело: ждём и повторяем, максимум 3 раза
@@ -832,8 +835,22 @@ async function runCh(model, seq, diList, rowFilter) {
   renderRows(model);
   try {
     const doms = diList.map(di => model.domains[di]);
-    const starts = await Promise.all(
-      doms.map(d => chFetch(`/check-http?host=${encodeURIComponent(d)}&max_nodes=${settings.maxNodes}`)));
+    // те же узлы для всех доменов: первый запрос выбирает узлы, остальные получают их явно (node=)
+    // (иначе check-host берёт случайный набор на каждый запрос и сравнивать домены нечем)
+    const q = d => `/check-http?host=${encodeURIComponent(d)}`;
+    let nodeQs;
+    const starts = [];
+    if (rowFilter) {
+      const want = [...rowFilter].filter(k => k.startsWith('ch:')).map(k => k.slice(3));
+      if (!want.length) { dropMsg(model, pend); spin.ch = false; renderRows(model); return; }
+      nodeQs = want.map(n => '&node=' + encodeURIComponent(n)).join('');
+      starts.push(...await Promise.all(doms.map(d => chFetch(q(d) + nodeQs))));
+    } else {
+      const first = await chFetch(q(doms[0]) + `&max_nodes=${settings.maxNodes}`);
+      starts.push(first);
+      nodeQs = Object.keys(first.nodes || {}).map(n => '&node=' + encodeURIComponent(n)).join('');
+      starts.push(...await Promise.all(doms.slice(1).map(d => chFetch(q(d) + nodeQs))));
+    }
     if (seq !== runSeq) return;
     const nodeMeta = {};
     for (const s of starts) {
@@ -891,9 +908,23 @@ async function runGp(model, seq, diList, rowFilter) {
   try {
     const doms = diList.map(di => model.domains[di]);
     // создаём измерения ПО ОДНОМУ с паузой — не бомбим API (429)
+    // ВАЖНО: все домены меряются ОДНИМИ И ТЕМИ ЖЕ пробами (locations = id первого измерения),
+    // иначе сравнение «.com vs .ru из одной точки» невозможно — GlobalPing иначе берёт случайные пробы
+    let locs = null;
+    if (rowFilter) {
+      locs = [...rowFilter].filter(k => k.startsWith('gp:')).map(k => {
+        const [country, city, network] = k.slice(3).split('|');
+        const l = { limit: 1 };
+        if (country) l.country = country;
+        if (city) l.city = city;
+        if (network) l.network = network;
+        return l;
+      });
+      if (!locs.length) { dropMsg(model, pend); spin.gp = false; renderRows(model); return; }
+    }
     const ids = [];
     for (const d of doms) {
-      ids.push(await gpStart(d));
+      ids.push(await gpStart(d, locs || (ids.length ? ids[0] : null)));
       if (doms.length > 1) await sleep(2500);
     }
     log(`GlobalPing: измерения созданы: ${ids.map(x => x.slice(0, 8)).join(', ')}`);
@@ -951,7 +982,13 @@ function tallyModel(model) {
   return summary;
 }
 
-function finalize(model, seq, tRun) {
+function releaseRunButton() {
+  const btn = document.getElementById('btnRun');
+  btn.disabled = false; btn.textContent = '▶ Запустить проверку';
+  document.title = 'GeoCheck';
+}
+
+function finalize(model, seq, tRun, full = false) {
   // честные «нет данных»: точка участвовала в прогоне, а ячейка пуста/висит в loading —
   // значит источник не довёз результат. Красный ERR с причиной вместо серого «—»
   // («—» остаётся только у точек, выключенных чекбоксом, и у свёрнутых успешных)
@@ -972,7 +1009,7 @@ function finalize(model, seq, tRun) {
   saveLastRun(model);
   document.getElementById('btnCsv').disabled = false;
   document.getElementById('btnJson').disabled = false;
-  pushHistory(summary, model);
+  if (full) pushHistory(summary, model);   // перепроверки точек/ячеек историю не засоряют
   setAction(`прогон ${seq} завершён — ок: ${summary.ok}, предупр.: ${summary.warn}, ошибок: ${summary.err} · ${new Date().toLocaleTimeString('ru-RU')}`);
   if (histViewAt) closeHistView(); else renderRows(model);
 }
@@ -1019,14 +1056,18 @@ async function runAllNow() {
   markLoading(model, diList, null);
   renderRows(model);
 
-  await runLocal(model, seq, diList, null);
-  if (seq !== runSeq) return;
-  await runCh(model, seq, diList, null);
-  if (seq !== runSeq) return;
-  await runGp(model, seq, diList, null);
-  if (seq !== runSeq) return;
-  finalize(model, seq, tRun);
-  btn.disabled = false; btn.textContent = '▶ Запустить проверку';
+  try {
+    await runLocal(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    await runCh(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    await runGp(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    finalize(model, seq, tRun, true);
+  } finally {
+    releaseRunButton();   // даже если прогон прерван перепроверкой или упал
+    spin.local = spin.ch = spin.gp = false;
+  }
 }
 
 async function reCheckSource(id) {
@@ -1272,12 +1313,15 @@ document.getElementById('btnDaemonPing').onclick = async () => {
 document.getElementById('btnSendSubs').onclick = async () => {
   const raw = document.getElementById('setSubs').value.split('\n').map(s => s.trim()).filter(Boolean);
   const msg = document.getElementById('subsMsg');
-  if (!raw.length) { msg.textContent = 'пусто — вставьте URL подписки'; return; }
+  if (!raw.length) { msg.textContent = 'пусто — вставьте URL подписки или ссылки vless://…'; return; }
   msg.textContent = 'отправляю на 127.0.0.1…';
   try {
     const r = await fetch(daemonBase() + '/set_subscriptions', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls: raw }), signal: AbortSignal.timeout(120000),
+      body: JSON.stringify({
+        urls: raw.filter(s => /^https?:\/\//i.test(s)),
+        inline: [raw.filter(s => !/^https?:\/\//i.test(s)).join('\n')].filter(Boolean),
+      }), signal: AbortSignal.timeout(120000),
     });
     const j = await r.json();
     if (j.ok) {

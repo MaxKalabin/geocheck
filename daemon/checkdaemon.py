@@ -18,6 +18,7 @@ GeoCheck local daemon — локальный помощник дашборда.
   set RG_SUBS=https://...;https://...        # необязательно — можно передать из дашборда
   set SINGBOX_PATH=C:\\path\\sing-box.exe   # если ядро не найдено автоматически
 """
+import atexit
 import base64
 import glob
 import json
@@ -34,8 +35,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get('RG_DAEMON_PORT', '8787'))
 BASE_PORT = 21000
+MAX_EXITS = int(os.environ.get('RG_MAX_EXITS', '40'))
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GeoCheck/1.0'
 CURL = shutil.which('curl') or shutil.which('curl.exe')
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# приватная временная папка: конфиги ядер содержат учётные данные прокси
+WORK = tempfile.mkdtemp(prefix='geocheck-')
+# какие страницы вправе дёргать демон (CORS/Origin). Добавить свои: RG_ORIGINS=https://geocheck.example.com,...
+ALLOWED_ORIGINS = {'http://127.0.0.1:7100', 'http://localhost:7100'}
+ALLOWED_ORIGINS |= {o.strip().rstrip('/') for o in os.environ.get('RG_ORIGINS', '').split(',') if o.strip()}
 
 STATE = {
     'subs_urls': [u for u in re.split(r'[\n;]', os.environ.get('RG_SUBS', '')) if u.strip()],
@@ -54,6 +62,10 @@ def find_singbox():
         os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs'),
         r'C:\Program Files', r'C:\Program Files (x86)',
     ]
+    for name in ('sing-box', 'sing-box.exe', 'HiddifyCore', 'HiddifyCore.exe'):
+        found = shutil.which(name)
+        if found:
+            return found, ('srun' if 'hiddify' in name.lower() else 'run')
     candidates = []
     for root in roots:
         for d in glob.glob(os.path.join(root, 'Hiddify*')) + glob.glob(os.path.join(root, '*hiddify*')):
@@ -84,11 +96,12 @@ def parse_subscription(text):
             pass
         if outs:
             return outs
-    try:
-        dec = _b64d(text).decode('utf-8', 'ignore')
-        lines = [l.strip() for l in dec.splitlines() if l.strip()]
-    except Exception:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not re.search(r'^(vless|vmess|trojan|ss)://', text, re.I | re.M):   # не открытые ссылки → base64
+        try:
+            lines = [l.strip() for l in _b64d(text).decode('utf-8', 'ignore').splitlines() if l.strip()]
+        except Exception:
+            pass
     for line in lines:
         o = parse_share_link(line)
         if o:
@@ -143,7 +156,12 @@ def parse_share_link(line):
                 o['transport'] = {'type': 'grpc', 'service_name': qs.get('serviceName', '')}
                 if qs.get('packetEncoding'):
                     o['packet_encoding'] = qs['packetEncoding']   # обычно xudp
-            elif ttype in ('xhttp', 'httpupgrade'):
+            elif ttype == 'httpupgrade':
+                o['transport'] = {'type': 'httpupgrade', 'path': qs.get('path', '/')}
+                host = qs.get('host') or qs.get('sni') or u.hostname
+                if host:
+                    o['transport']['host'] = host
+            elif ttype in ('xhttp', 'splithttp'):
                 # xhttp (sing-box ≥1.12): path + mode; host — отдельным полем
                 # (headers.Host на этом форке даёт FATAL "headers can't contain host")
                 o['transport'] = {'type': 'xhttp', 'path': qs.get('path', '/')}
@@ -245,16 +263,18 @@ def resolve_ipv4(host):
 def probe(url, port=None, capture_body=False):
     """curl-замер; port=None → системный маршрут (через текущий VPN).
     capture_body=True — вернуть тело ответа в res['body'] (для прогрева/exit-IP)."""
-    tmp = tempfile.gettempdir()
+    if not re.match(r'^https?://\S+$', url or '', re.I):
+        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)', 'error': 'bad url'}
+    tmp = WORK
     hdr = os.path.join(tmp, f'geocheck-h-{threading.get_ident()}.txt')
     body_f = os.path.join(tmp, f'geocheck-b-{threading.get_ident()}.txt')
     fmt = r'\n%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{remote_ip}'
     cmd = [CURL, '-sS', '-4', '--ssl-no-revoke',  # Schannel: иначе CRYPT_E_REVOCATION_OFFLINE на этой машине
-           '-o', body_f if capture_body else 'NUL', '-D', hdr, '-w', fmt,
+           '-o', body_f if capture_body else os.devnull, '-D', hdr, '-w', fmt,
            '--max-time', '60', '--connect-timeout', '20', '-A', UA]
     if port:
         cmd += ['-x', f'socks5h://127.0.0.1:{port}']
-    cmd.append(url)
+    cmd += ['--', url]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=85)
         out = (p.stdout or '').strip().splitlines()
@@ -290,14 +310,21 @@ def probe(url, port=None, capture_body=False):
         if not code:
             err = (p.stderr or '').strip()
             low = err.lower()
-            if 'connection timed out' in low:
+            rc = p.returncode
+            if rc == 28 and 'connection timed out' in low:
                 res['note'] = 'нет ответа: соединение не установлено за 20с — сервер/фаервол роняет пакеты'
-            elif 'operation timed out' in low or 'timed out' in low:
+            elif rc == 28:
                 res['note'] = 'сервер отвечал дольше 60с — обрыв по потолку ожидания'
-            elif 'socks5' in low or '97' in low:
+            elif rc == 97 or 'socks5' in low:
                 res['note'] = 'туннель не поднялся — ядро sing-box или сервер VPN недоступны'
+            elif rc in (35, 51, 58, 60):
+                res['note'] = 'ошибка TLS-рукопожатия — режут на пути (DPI/фаервол) или сертификат'
+            elif rc == 6:
+                res['note'] = 'домен не резолвится'
+            elif rc in (7, 52, 56):
+                res['note'] = 'соединение сброшено/отказано'
             else:
-                res['note'] = 'обрыв/таймаут'
+                res['note'] = f'обрыв/таймаут (curl {rc})'
             res['error'] = err[:400]
         if capture_body:
             try:
@@ -344,7 +371,9 @@ def configure(urls, inline=None):
                                'port': None, 'status': 'через текущий VPN/провайдера'})
         STATE['sb'] = sb
         STATE['sb_mode'] = sb_mode
-        for i, p in enumerate(proxies[:24]):
+        if len(proxies) > MAX_EXITS:
+            warnings.append(f'нод в подписках {len(proxies)}, взято первых {MAX_EXITS} (RG_MAX_EXITS)')
+        for i, p in enumerate(proxies[:MAX_EXITS]):
             port = BASE_PORT + i
             label = p.get('_name') or f'proxy-{i+1}'
             host = p.get('server', '')
@@ -358,13 +387,13 @@ def configure(urls, inline=None):
             STATE['exits'].append(ex)
             if sb:
                 cfg, _ = sb_config(p, port)
-                cfg_path = os.path.join(tempfile.gettempdir(), f'geocheck-sb-{port}.json')
+                cfg_path = os.path.join(WORK, f'sb-{port}.json')
                 with open(cfg_path, 'w', encoding='utf-8') as f:
                     json.dump(cfg, f)
                 try:
                     proc = subprocess.Popen([sb, sb_mode, '-c', cfg_path],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                            cwd=tempfile.gettempdir())  # не мусорить в папке проекта
+                                            cwd=WORK)
                     ex['proc'] = proc
                     ex['cfg'] = cfg_path
                     time.sleep(0.4)
@@ -389,7 +418,7 @@ def start_core(ex):
     try:
         proc = subprocess.Popen([sb, sb_mode, '-c', ex['cfg']],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                cwd=tempfile.gettempdir())
+                                cwd=WORK)
         ex['proc'] = proc
         time.sleep(0.4)
         if proc.poll() is not None:
@@ -486,6 +515,15 @@ def warmup():
     return res
 
 
+def shutdown_cores():
+    for ex in list(STATE['exits']):
+        kill_exit(ex)
+    shutil.rmtree(WORK, ignore_errors=True)
+
+
+atexit.register(shutdown_cores)
+
+
 # ---------------------------------------------------------------- HTTP
 FWD_HOSTS = ('check-host.net', 'api.globalping.io')
 
@@ -528,8 +566,19 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _guard(self):
+        """Защита от DNS-rebinding и чужих сайтов: Host — только loopback, Origin — из белого списка."""
+        host = (self.headers.get('Host') or '').rsplit(':', 1)[0].strip('[]').lower()
+        origin = (self.headers.get('Origin') or '').rstrip('/')
+        if host not in ('127.0.0.1', 'localhost') or (origin and origin not in ALLOWED_ORIGINS):
+            self._json({'ok': False, 'error': 'forbidden (origin/host)'}, 403)
+            return False
+        return True
+
     def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
+        origin = (self.headers.get('Origin') or '').rstrip('/')
+        self.send_header('Access-Control-Allow-Origin', origin if origin in ALLOWED_ORIGINS else 'null')
+        self.send_header('Vary', 'Origin')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Allow-Private-Network', 'true')
@@ -544,23 +593,27 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_OPTIONS(self):
+        if not self._guard():
+            return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        if not self._guard():
+            return
         if self.path.startswith('/fwd'):
             return self.fwd_request('GET')
         if self.path.startswith('/warmup'):
             self._json({'ok': True, 'results': warmup()})
         elif self.path.startswith('/status'):
             self._json({'ok': True, 'version': '1.0', 'exits': public_exits()})
-        elif self.path.startswith('/run'):
-            self._json({'ok': True, 'results': run_checks(json.loads('{}').get('domains', []))})
         else:
             self._json({'ok': False, 'error': 'unknown'}, 404)
 
     def do_POST(self):
+        if not self._guard():
+            return
         if self.path.startswith('/fwd'):
             return self.fwd_request('POST')
         try:
@@ -585,15 +638,33 @@ class H(BaseHTTPRequestHandler):
             self._json({'ok': False, 'error': 'unknown'}, 404)
 
 
+def load_local_files():
+    """subs.txt (URL подписок и/или vless://-ссылки) и user_nodes.txt (ссылки) рядом с проектом.
+    Файлы читает только демон; содержимое не выводится в логи."""
+    urls, inline = [], []
+    for name in ('subs.txt', 'user_nodes.txt'):
+        path = os.path.join(ROOT, name)
+        if not os.path.exists(path):
+            continue
+        for line in open(path, encoding='utf-8', errors='ignore').read().splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            (urls if line.lower().startswith(('http://', 'https://')) else inline).append(line)
+    return urls, (['\n'.join(inline)] if inline else [])
+
+
 def main():
     if not CURL:
         raise SystemExit('curl.exe не найден в PATH')
     if not STATE['exits']:
         STATE['exits'].append({'id': 'direct', 'label': 'Этот ПК (системный канал)',
                                'port': None, 'status': 'через текущий VPN/провайдера'})
-    if STATE['subs_urls']:
-        r = configure(STATE['subs_urls'])
-        print('Подписки из RG_SUBS загружены · выходов:', len(r['exits']))
+    urls, inline = load_local_files()
+    urls = STATE['subs_urls'] + [u for u in urls if u not in STATE['subs_urls']]
+    if urls or inline:
+        r = configure(urls, inline)
+        print('Подписки загружены · выходов:', len(r['exits']))
         for w in r['warnings']:
             print('WARN:', w)
     print(f'GeoCheck daemon: http://127.0.0.1:{PORT}  (только локально, секреты не сохраняются)')
