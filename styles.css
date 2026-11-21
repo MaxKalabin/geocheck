@@ -1,0 +1,216 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --panel-2: #1c2330;
+  --border: #2b3340;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --green: #3fb950;
+  --blue: #58a6ff;
+  --orange: #d29922;
+  --red: #f85149;
+  --grey: #6e7681;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  display: flex; flex-direction: column; overflow: hidden; /* страница НЕ скроллится */
+}
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+  flex: none;
+}
+h1 { font-size: 18px; margin: 0; letter-spacing: .5px; }
+.sub { color: var(--muted); font-size: 12px; margin-left: 12px; }
+.hd-right { display: flex; align-items: center; gap: 10px; }
+.btn {
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+  padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+}
+.btn:hover { border-color: var(--blue); }
+.btn-primary { background: #1f6feb; border-color: #1f6feb; color: #fff; font-weight: 600; }
+.btn-primary:disabled { opacity: .5; cursor: default; }
+.btn-ghost { background: transparent; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.dot-grey { background: var(--grey); }
+.dot-green { background: var(--green); }
+.dot-red { background: var(--red); }
+
+.domains-bar { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 20px 0; flex: none; }
+.chip {
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  padding: 6px 12px; border-radius: 999px; font-size: 13px; cursor: pointer;
+}
+.chip.active { border-color: var(--blue); color: var(--blue); }
+.chip .x { color: var(--muted); margin-left: 8px; }
+.chip .x:hover { color: var(--red); }
+
+.legend { display: flex; gap: 16px; padding: 10px 20px; color: var(--muted); font-size: 12px; flex-wrap: wrap; flex: none; }
+.legend .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+
+/* центральная зона: листается ТОЛЬКО она */
+#matrixWrap {
+  margin: 6px 20px 8px; flex: 1 1 auto; min-height: 0;
+  overflow: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+}
+table { border-collapse: collapse; width: 100%; min-width: 560px; }
+th, td { padding: 8px 12px; border-bottom: 1px solid var(--border); text-align: left; font-size: 13px; }
+th { background: var(--panel-2); color: var(--muted); font-weight: 600; }
+tr.group td {
+  background: var(--panel-2); color: var(--blue); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 1px; padding: 5px 12px;
+}
+/* строка группы: ячейка управления + счётчики под колонками доменов */
+tr.group td.gh-cell {
+  text-transform: none; letter-spacing: 0; color: var(--text);
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+}
+tr.group td.gh-cnt { text-transform: none; letter-spacing: 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+.grphok { display: inline-flex; gap: 4px; align-items: center; font-size: 11px; color: var(--muted); cursor: pointer; }
+.hokg { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.ok-line a { color: var(--green); }
+.exip {
+  font-size: 11px; color: var(--blue); background: rgba(88,166,255,.1);
+  border: 1px solid rgba(88,166,255,.35); border-radius: 6px; padding: 0 6px;
+  margin-left: 6px; white-space: nowrap;
+}
+td.node { white-space: nowrap; }
+td.node .prov { color: var(--muted); font-size: 11px; }
+.cell { border-radius: 6px; padding: 3px 6px; display: inline-block; min-width: 0; white-space: nowrap; text-align: center; cursor: pointer; font-variant-numeric: tabular-nums; }
+tr.msg td { color: var(--orange); font-size: 12px; padding: 6px 12px; }
+tr.msg.pending td { color: var(--muted); animation: pulse 1.2s infinite; }
+.cell .ms { opacity: .8; font-size: 11px; }
+.cell.ok { background: rgba(63,185,80,.15); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+.cell.redir { background: rgba(88,166,255,.13); color: var(--blue); border: 1px solid rgba(88,166,255,.4); }
+.cell.warn { background: rgba(210,153,34,.14); color: var(--orange); border: 1px solid rgba(210,153,34,.45); }
+.cell.bad { background: rgba(248,81,73,.14); color: var(--red); border: 1px solid rgba(248,81,73,.45); }
+.cell.err { background: rgba(110,118,129,.15); color: var(--grey); border: 1px solid rgba(110,118,129,.4); }
+.cell.loading { color: var(--muted); border: 1px dashed var(--border); background: transparent; animation: pulse 1.2s infinite; }
+@keyframes pulse { 50% { opacity: .4; } }
+
+/* кнопка перепроверки ячейки — появляется при наведении на строку */
+.cellwrap { display: inline-flex; gap: 3px; align-items: center; }
+.cellretry { visibility: hidden; background: transparent; border: 1px solid var(--border); border-radius: 5px; color: var(--muted); cursor: pointer; font-size: 11px; line-height: 1; padding: 2px 5px; }
+.cellretry:hover { color: var(--blue); border-color: var(--blue); }
+tbody tr:hover .cellretry { visibility: visible; }
+.cellretry:disabled { opacity: .4; cursor: default; }
+
+/* кто отдал ошибку: CF = фронт CloudFlare (cf-ray есть), сайт = ориджин */
+.cfbadge { background: rgba(210,153,34,.18); color: var(--orange); border: 1px solid rgba(210,153,34,.5); border-radius: 4px; padding: 0 4px; font-size: 10px; white-space: nowrap; }
+.orgbadge { background: rgba(248,81,73,.14); color: var(--red); border: 1px solid rgba(248,81,73,.45); border-radius: 4px; padding: 0 4px; font-size: 10px; white-space: nowrap; }
+
+/* детали под нодой: компактный блок, строка на домен */
+.detail-row td { background: rgba(88,166,255,.05); border-top: 1px dashed var(--border); padding: 8px 12px 10px 46px; }
+.dbox { display: flex; flex-direction: column; gap: 3px; align-items: flex-start; font-size: 12px; }
+.dbox .btn.mini { align-self: flex-end; margin-top: 2px; }
+.dline { display: flex; gap: 8px; align-items: center; white-space: nowrap; flex-wrap: wrap; }
+.dline b { font-weight: 600; }
+.dextra { color: var(--muted); font-size: 11px; }
+
+/* группы: каретка сворачивания + счётчики по доменам */
+.caret { background: none; border: none; cursor: pointer; color: var(--blue); font-size: 13px; padding: 0 4px 0 0; }
+.gchentry { display: inline-flex; gap: 6px; align-items: center; }
+.gcnt { margin-left: 12px; display: inline-flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.gdom b { font-size: 11px; }
+.star.retry { color: var(--blue); }
+.star.retry:hover { color: var(--text); }
+
+#history { padding: 0 20px 6px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 12px; flex: none; }
+.hdot { width: 14px; height: 14px; border-radius: 4px; cursor: pointer; flex: none; }
+.hdot.cur { outline: 2px solid var(--blue); outline-offset: 1px; }
+
+footer { padding: 4px 20px 6px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); flex: none; }
+footer code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; }
+
+.modal {
+  position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal.hidden, .hidden { display: none; }
+.modal-box {
+  width: min(640px, 92vw); max-height: 86vh; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px;
+}
+.modal-box h2 { margin: 0 0 16px; font-size: 16px; }
+.field { margin-bottom: 14px; }
+.field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+.field input[type=text], .field input[type=number], .field textarea {
+  width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 8px 10px; font: 13px/1.4 "Cascadia Mono", Consolas, monospace;
+}
+.field textarea { min-height: 72px; resize: vertical; }
+.field .hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.checkline { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+.checkline label { color: var(--text); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+.badge.secure { color: var(--green); border-color: rgba(63,185,80,.5); }
+#settingsMsg { color: var(--orange); font-size: 12px; min-height: 16px; margin-top: 8px; }
+
+/* липкая шапка таблицы (липнет к верху скролл-контейнера #matrixWrap) */
+thead th { position: sticky; top: 0; z-index: 4; background: var(--panel-2); }
+table { border-collapse: separate; border-spacing: 0; }
+
+.ctl-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 20px 0; flex: none; }
+.ctl-bar .ctl { color: var(--muted); font-size: 12px; display: flex; gap: 5px; align-items: center; }
+.ctl-hint { color: var(--grey); font-size: 11px; }
+.btn.mini { padding: 1px 8px; font-size: 11px; margin-left: 8px; }
+.gtitle { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--blue); }
+.gsub { margin-left: 10px; color: var(--grey); font-size: 11px; text-transform: none; letter-spacing: 0; }
+.spin { display: inline-block; margin-left: 8px; color: var(--blue); animation: rot 1s linear infinite; }
+.hidden { display: none; }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+.cbline { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+.cnt b { font-weight: 600; font-size: 11px; margin-right: 2px; font-variant-numeric: tabular-nums; }
+.c-ok { color: var(--green); } .c-warn { color: var(--orange); } .c-err { color: var(--red); } .c-na { color: var(--grey); }
+th.dim, .chip.dim { opacity: .45; }
+.row-off td { opacity: .45; }
+/* недоступные ноды: серые, внизу, с крестиком удаления */
+.row-dead td { opacity: .42; background: rgba(110,118,129,.06); }
+.star.del { color: var(--grey); }
+.star.del:hover { color: var(--red); }
+.dead-line a { color: var(--orange); }
+.rowctl { float: left; margin-right: 8px; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.rowctl input { margin: 0; }
+.star { background: none; border: none; cursor: pointer; color: var(--grey); font-size: 13px; padding: 0; line-height: 1; }
+.star.on, .star:hover { color: #e3b341; }
+.ntext { overflow: hidden; }
+.cell.empty { color: var(--grey); border: 1px dashed var(--border); background: transparent; cursor: default; }
+
+#histBanner { margin: 8px 20px 0; padding: 8px 14px; border: 1px solid rgba(88,166,255,.5); border-radius: 8px; background: rgba(88,166,255,.08); color: var(--blue); font-size: 13px; }
+
+#history .hitem { display: inline-flex; align-items: center; gap: 2px; margin-right: 4px; }
+#history .hdel { color: var(--grey); cursor: pointer; font-size: 10px; }
+#history .hdel:hover { color: var(--red); }
+
+/* подвал: журнал — фиксированная панель со своим скроллом */
+.log-wrap {
+  flex: none; height: 190px; display: flex; flex-direction: column;
+  margin: 0 20px 8px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel);
+}
+.log-head { display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; flex: none; }
+.log-head .log-actions { display: flex; gap: 6px; align-items: center; }
+.log-head .btn { padding: 2px 8px; font-size: 11px; }
+.log-head .log-filter { display: flex; gap: 4px; align-items: center; font-size: 11px; cursor: pointer; }
+.log-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 12px; font: 11px/1.65 Consolas, "Cascadia Mono", monospace; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+.log-body .t { color: var(--grey); margin-right: 6px; }
+.log-body .ok { color: var(--green); }
+.log-body .warn { color: var(--orange); }
+.log-body .err { color: var(--red); }
+/* фильтр «только плохие»: прячем записи без класса err/warn */
+.log-wrap.only-bad .log-body > div:not(.err):not(.warn) { display: none; }
+.log-wrap.collapsed { height: auto; }
+.log-wrap.collapsed .log-body { display: none; }
+.last-action { padding: 4px 12px; border-bottom: 1px solid var(--border); color: var(--text); font-size: 12px; background: var(--panel-2); flex: none; }
+.last-action::before { content: '➤ '; color: var(--blue); }
+/* журнал на весь экран */
+.log-wrap.max { position: fixed; inset: 10px; z-index: 60; height: auto; box-shadow: 0 0 0 9999px rgba(0,0,0,.55); }
+
+@media (max-width: 720px) {
+  .sub { display: none; }
+}

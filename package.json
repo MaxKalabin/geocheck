@@ -1,0 +1,9 @@
+{
+  "name": "geocheck",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GeoCheck — дашборд проверки доступности сайта из разных стран (check-host.net + GlobalPing + локальный демон)",
+  "scripts": {
+    "dev": "node server.js"
+  }
+}
