@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -471,13 +472,40 @@ def public_exits():
             for e in STATE['exits']]
 
 
-def run_checks(domains):
+def browser_probe(url, port):
+    """Проверка настоящим браузером (daemon/browser_probe.py): антибот-заглушка со Send, время загрузки."""
+    if not re.match(r'^https?://\S+$', url or '', re.I):
+        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)'}
+    try:
+        p = subprocess.run([sys.executable, '-I', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'browser_probe.py'),
+                            url, str(port or '')], capture_output=True, text=True, timeout=150)
+        return json.loads((p.stdout or '').strip().splitlines()[-1])
+    except Exception as e:
+        return {'code': 0, 'note': 'браузерный пробник не ответил', 'error': str(e)[:300]}
+
+
+def run_checks(domains, browser=False, domain_first=False):
     ensure_cores()   # поднять ядра, которые умерли между прогонами
     exits = list(STATE['exits'])
     jobs = [(ex, d) for ex in exits for d in domains]
     results = {e['id']: {} for e in exits}
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = {pool.submit(probe, d, ex['port']): (ex, d) for ex, d in jobs}
+    with ThreadPoolExecutor(max_workers=4 if browser else 16) as pool:
+        fn = browser_probe if browser else probe
+
+        def job(ex, d):
+            if domain_first:
+                root = re.match(r'^(https?://[^/]+)', d)
+                root = root.group(1) + '/' if root else ''
+                if root and root != d:
+                    rr = fn(root, ex['port'])
+                    if not rr.get('code') and not rr.get('hardBlock'):
+                        return {'code': 0, 'note': 'домен не грузится — страница не проверялась: ' + (rr.get('note') or ''),
+                                'rootCode': 0, 'rootMs': rr.get('ms'), 'skipped': True}
+                    res = fn(d, ex['port'])
+                    res['rootCode'], res['rootMs'] = rr.get('code'), rr.get('ms')
+                    return res
+            return fn(d, ex['port'])
+        futs = {pool.submit(job, ex, d): (ex, d) for ex, d in jobs}
         for fut, (ex, d) in futs.items():
             results[ex['id']][d] = fut.result()
     return results
@@ -633,7 +661,7 @@ class H(BaseHTTPRequestHandler):
             domains = [d for d in body.get('domains', []) if isinstance(d, str)]
             if not domains:
                 return self._json({'ok': False, 'error': 'нет доменов'}, 400)
-            self._json({'ok': True, 'results': run_checks(domains)})
+            self._json({'ok': True, 'results': run_checks(domains, bool(body.get('browser')), bool(body.get('domainFirst')))})
         else:
             self._json({'ok': False, 'error': 'unknown'}, 404)
 

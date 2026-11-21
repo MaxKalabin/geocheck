@@ -20,6 +20,9 @@ const DEFAULTS = {
   ],
   useCheckHost: true,
   useGlobalPing: true,
+  useBrowser: true,
+  domainFirst: true,
+  slowMs: 10000,
   maxNodes: 30,
   daemonPort: 8787,
   exitLabels: ['Этот ПК (системный канал)'],
@@ -60,7 +63,10 @@ function shortDomain(u) {
   catch { return u; }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
-function cellClass(code) {
+function cellClass(code, c) {
+  if (c && c.hardBlock) return 'warn';
+  if (c && c.antibot) return c.captcha === 'failed' ? 'bad' : (c.ms > settings.slowMs ? 'warn' : 'redir');
+  if (c && c.engine === 'browser' && code && c.ms > settings.slowMs) return 'warn';
   if (!code) return 'err';
   if (code >= 200 && code < 300) return 'ok';
   if (code >= 300 && code < 400) return 'redir';
@@ -68,8 +74,13 @@ function cellClass(code) {
   if (code >= 500) return 'bad';
   return 'err';
 }
-function isFailed(c) { return !c || !c.code || c.code >= 500; }
-function cellText(code, ms, note) {
+function isFailed(c) { return !c || (!c.hardBlock && (!c.code || c.code >= 500 || (c.antibot && c.captcha === 'failed') || (c.engine === 'browser' && c.ms > settings.slowMs))); }
+function cellText(code, ms, note, c) {
+  if (c && c.hardBlock) return '⛔ nginx 503 (антибот)';
+  if (c && c.antibot && c.captcha === 'failed') return '🛡 Send не прошёл';
+  if (c && c.antibot) return `🛡 Send · ${((c.ms || 0) / 1000).toFixed(1)}s`;
+  if (c && c.skipped) return 'домен не грузится';
+  if (c && c.engine === 'browser' && code && ms > settings.slowMs) return `${code} · медленно ${(ms / 1000).toFixed(1)}s`;
   if (!code) return `ERR${note ? ' · ' + note : ''}`;
   const sec = (ms == null || isNaN(ms)) ? '' : ` · ${(ms / 1000).toFixed(2)}s`;
   const tag = code === 403 ? ' ⚠CF' : '';
@@ -81,6 +92,11 @@ function errorOrigin(c) {
   return c.cfRay ? 'cf' : 'origin';
 }
 function verdict(code, c) {
+  if (c && c.hardBlock) return 'жёсткий антибот сайта: nginx 503 Service Temporarily Unavailable — обходить нельзя, это не заглушка со Send';
+  if (c && c.antibot) return c.captcha === 'failed' ? 'заглушка со Send: после нажатия страница не открылась' : `заглушка со Send пройдена одним нажатием: заглушка ${((c.msLanding||0)/1000).toFixed(1)}s + загрузка после Send ${((c.msAfterCaptcha||0)/1000).toFixed(1)}s = ${((c.ms||0)/1000).toFixed(1)}s`;
+  if (c && c.skipped) return c.note;
+  if (c && c.engine === 'browser' && !c.code) return c.note || 'страница не грузится';
+  if (c && c.engine === 'browser' && c.ms > settings.slowMs) return `загрузилась, но очень долго: ${(c.ms / 1000).toFixed(1)} с (порог ${settings.slowMs / 1000} с)`;
   const byCf = errorOrigin(c) === 'cf';
   if (!code) return 'обрыв соединения / таймаут — нода или сеть недоступны';
   if (code >= 200 && code < 300) return 'ок';
@@ -152,7 +168,7 @@ function rowOk(r, diList) {
   return diList.every(di => {
     const c = r.cells[di];
     if (!c || c.loading) return false;
-    const cls = cellClass(c.code);
+    const cls = cellClass(c.code, c);
     return cls === 'ok' || cls === 'redir';
   });
 }
@@ -283,7 +299,7 @@ function renderRows(model) {
       doms.forEach((_, di) => {
         const c = r.cells[di];
         if (!c) { tall[di].na++; return; }
-        const cls = c.loading ? 'na' : cellClass(c.code);
+        const cls = c.loading ? 'na' : cellClass(c.code, c);
         if (cls === 'ok' || cls === 'redir') tall[di].ok++;
         else if (cls === 'warn') tall[di].warn++;
         else if (cls === 'na') tall[di].na++;
@@ -338,7 +354,7 @@ function renderRows(model) {
       doms.forEach((_, di) => {
         const c = r.cells[di];
         if (!c) { gt[di].na++; return; }
-        const cls = c.loading ? 'na' : cellClass(c.code);
+        const cls = c.loading ? 'na' : cellClass(c.code, c);
         if (cls === 'ok' || cls === 'redir') gt[di].ok++;
         else if (cls === 'warn') gt[di].warn++;
         else if (cls === 'na') gt[di].na++;
@@ -424,8 +440,8 @@ function rowHtml(r, doms, dead = false) {
     const rb = `<button class="cellretry" data-k="${esc(r.key)}" data-d="${di}" title="перепроверить только эту ячейку">⟳</button>`;
     if (!c) return `<td><span class="cellwrap"><span class="cell empty" title="не участвует в прогоне / не проверялось">—</span>${rb}</span></td>`;
     if (c.loading) return `<td><span class="cellwrap"><span class="cell loading">…</span>${rb}</span></td>`;
-    const cls = cellClass(c.code);
-    return `<td><span class="cellwrap"><span class="cell ${cls}" data-k="${esc(r.key)}" data-d="${di}">${esc(cellText(c.code, c.ms, c.note))}</span>${cellBadge(c, r.key)}${rb}</span></td>`;
+    const cls = cellClass(c.code, c);
+    return `<td><span class="cellwrap"><span class="cell ${cls}" data-k="${esc(r.key)}" data-d="${di}">${esc(cellText(c.code, c.ms, c.note, c))}</span>${cellBadge(c, r.key)}${rb}</span></td>`;
   }).join('');
   return h + '</tr>';
 }
@@ -524,7 +540,7 @@ function detailRowHtml(r, doms, nCols) {
     const dom = `<b>${esc(shortDomain(d))}</b>`;
     if (!c) return `<div class="dline"><span class="cell empty">—</span> ${dom} · нет данных</div>`;
     if (c.loading) return `<div class="dline"><span class="cell loading">…</span> ${dom} · проверяю…</div>`;
-    const cls = cellClass(c.code);
+    const cls = cellClass(c.code, c);
     const ms = (c.ms != null && !isNaN(c.ms)) ? ` · ${(c.ms / 1000).toFixed(2)}s` : '';
     const extras = [];
     if (c.code) {
@@ -534,7 +550,7 @@ function detailRowHtml(r, doms, nCols) {
       if (c.ip) extras.push('ip ' + c.ip);
       if (c.server) extras.push(c.server);
     }
-    return `<div class="dline"><span class="cell ${cls}">${esc(cellText(c.code, null, c.note))}</span> ${dom}${ms} · ${esc(verdict(c.code, c))}` +
+    return `<div class="dline"><span class="cell ${cls}">${esc(cellText(c.code, null, c.note, c))}</span> ${dom}${ms} · ${esc(verdict(c.code, c))}` +
       (extras.length ? ` · <span class="dextra">${esc(extras.join(' · '))}</span>` : '') + `</div>`;
   }).join('');
   return `<tr class="detail-row" data-k="${esc(r.key)}"><td colspan="${nCols}"><div class="dbox">${lines}` +
@@ -773,7 +789,7 @@ async function daemonRun(domains) {
   try {
     const r = await fetch(daemonBase() + '/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domains }), signal: AbortSignal.timeout(180000),
+      body: JSON.stringify({ domains, browser: !!settings.useBrowser, domainFirst: !!settings.domainFirst }), signal: AbortSignal.timeout(settings.useBrowser ? 900000 : 180000),
     });
     return await r.json();
   } catch { return null; }
@@ -973,7 +989,7 @@ function tallyModel(model) {
     if (r.isMsg) continue;
     Object.values(r.cells).forEach(c => {
       if (!c || c.loading) return;
-      const cls = cellClass(c.code);
+      const cls = cellClass(c.code, c);
       if (cls === 'ok' || cls === 'redir') summary.ok++;
       else if (cls === 'warn') summary.warn++;
       else summary.err++;
@@ -1237,6 +1253,8 @@ function openSettings() {
   document.getElementById('setDomains').value = settings.domains.join('\n');
   document.getElementById('setUseCheckHost').checked = settings.useCheckHost;
   document.getElementById('setUseGlobalPing').checked = settings.useGlobalPing;
+  document.getElementById('setUseBrowser').checked = !!settings.useBrowser;
+  document.getElementById('setDomainFirst').checked = !!settings.domainFirst;
   document.getElementById('setMaxNodes').value = settings.maxNodes;
   document.getElementById('setDaemonPort').value = settings.daemonPort;
   document.getElementById('setExitLabels').value = (settings.exitLabels || []).join(', ');
@@ -1293,6 +1311,8 @@ document.getElementById('btnSave').onclick = () => {
   domSel = null;
   settings.useCheckHost = document.getElementById('setUseCheckHost').checked;
   settings.useGlobalPing = document.getElementById('setUseGlobalPing').checked;
+  settings.useBrowser = document.getElementById('setUseBrowser').checked;
+  settings.domainFirst = document.getElementById('setDomainFirst').checked;
   settings.maxNodes = Math.min(40, Math.max(5, +document.getElementById('setMaxNodes').value || 30));
   settings.daemonPort = Math.min(65535, Math.max(1024, +document.getElementById('setDaemonPort').value || 8787));
   settings.exitLabels = document.getElementById('setExitLabels').value.split(',').map(s => s.trim()).filter(Boolean);

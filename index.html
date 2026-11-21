@@ -77,6 +77,8 @@
     <div class="checkline">
       <label><input type="checkbox" id="setUseCheckHost"> check-host.net (~30 узлов: ping/http/tcp/dns)</label>
       <label><input type="checkbox" id="setUseGlobalPing"> GlobalPing (сотни проб по миру)</label>
+      <label title="настоящий Chrome через каждый выход; антибот-заглушки помечаются отдельно и не считаются ошибкой; медленнее"><input type="checkbox" id="setUseBrowser"> браузерная проверка выходов (реальный статус, тайм-ауты, время загрузки)</label>
+      <label title="сначала открыть корень домена; если он не грузится — страницу не проверять"><input type="checkbox" id="setDomainFirst"> сначала проверять домен, потом страницу</label>
       <label>узлов: <input type="number" id="setMaxNodes" min="5" max="40" style="width:60px"></label>
     </div>
 
