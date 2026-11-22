@@ -10,3 +10,9 @@
 .scroll{overflow:auto;max-height:70vh}
 .bar{display:flex;gap:10px;align-items:center}
 .bar select{background:#161d29;color:inherit;border:1px solid #2a3342;border-radius:6px;padding:4px 8px}
+/* страница сравнения скроллится целиком (общий styles.css её блокирует) */
+html,body{height:auto;min-height:100%}
+body{display:block;overflow:auto}
+header{position:sticky;top:0;z-index:5}
+.cmp{padding-bottom:60px}
+.scroll{max-height:60vh}
