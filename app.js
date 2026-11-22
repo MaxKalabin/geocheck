@@ -126,16 +126,26 @@ function cellBadge(c, key) {
 
 /* ---------------- журнал выполнения ---------------- */
 function setAction(t) {
+  curPhase = t;
   const el = document.getElementById('lastAction');
   if (el) el.textContent = t;
 }
 /* живой лоадер: крутилка + секунды, пока идёт прогон (пробники ждут до 60с) */
 let runTick = null;
+let curPhase = '';
+const CLIENT_ID = Math.random().toString(36).slice(2, 12);
+let actBeat = null, actLabel = '';
+function actPost(body) {
+  return dFetch('/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: CLIENT_ID, ...body }) }).catch(() => { });
+}
 const SPIN_CHARS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 let spinIdx = 0;
 function startRunIndicator(label) {
   stopRunIndicator();
   const t0 = Date.now();
+  actLabel = label;
+  const beat = () => actPost({ label: actLabel, text: curPhase });
+  beat(); actBeat = setInterval(beat, 4000);
   runTick = setInterval(() => {
     const el = document.getElementById('lastAction');
     if (el) el.textContent = `${SPIN_CHARS[spinIdx++ % SPIN_CHARS.length]} ${label} — идёт проверка, ${((Date.now() - t0) / 1000).toFixed(0)} с…`;
@@ -143,6 +153,7 @@ function startRunIndicator(label) {
   }, 250);
 }
 function stopRunIndicator() {
+  if (actBeat) { clearInterval(actBeat); actBeat = null; actPost({ end: true }); }
   if (runTick) { clearInterval(runTick); runTick = null; }
   document.title = 'GeoCheck';
 }
@@ -691,6 +702,23 @@ function saveLastRun(model) {
   try { localStorage.setItem(LS_LAST, JSON.stringify(clean)); } catch { }
   dFetch('/lastmodel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: clean }) }).catch(() => { });
 }
+/* общий статус: если проверку запустили на другом устройстве — показываем это здесь */
+let remoteWas = false;
+async function watchActivity() {
+  try {
+    const r = await dFetch('/activity', { signal: AbortSignal.timeout(5000) });
+    const a = (await r.json()).activity;
+    const el = document.getElementById('remoteRun');
+    const other = a && a.id !== CLIENT_ID ? a : null;
+    if (el) {
+      el.hidden = !other;
+      if (other) el.textContent = `⏳ Идёт проверка, запущена на другом устройстве: ${other.label || 'прогон'} — ${other.elapsed} с${other.text ? ' · ' + other.text : ''}`;
+    }
+    if (remoteWas && !other && !actBeat) setTimeout(restoreServerRun, 2500);   // чужой прогон закончился — подтянем результат
+    remoteWas = !!other;
+  } catch { }
+}
+setInterval(watchActivity, 3000);
 async function restoreServerRun() {
   try {
     const r = await dFetch('/lastmodel');

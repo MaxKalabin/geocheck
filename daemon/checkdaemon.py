@@ -642,6 +642,40 @@ def scrub_model(m):
     return m
 
 
+ACTIVITY = {}          # общий статус «идёт проверка» для всех открытых страниц
+ACTIVITY_TTL = 20      # нет сигнала дольше — считаем, что вкладку закрыли
+_act_lock = threading.Lock()
+
+
+def activity_set(body):
+    if not isinstance(body, dict):
+        return False
+    rid = str(body.get('id') or '')[:40]
+    if not rid:
+        return False
+    with _act_lock:
+        if body.get('end'):
+            if ACTIVITY.get('id') == rid:
+                ACTIVITY.clear()
+            return True
+        if ACTIVITY.get('id') not in (None, rid) and time.time() - ACTIVITY.get('updated', 0) < ACTIVITY_TTL:
+            return False   # уже идёт чужая проверка
+        since = ACTIVITY.get('since') if ACTIVITY.get('id') == rid else time.time()
+        ACTIVITY.clear()
+        ACTIVITY.update({'id': rid, 'since': since, 'updated': time.time(),
+                         'label': str(body.get('label') or '')[:80], 'text': str(body.get('text') or '')[:200]})
+    return True
+
+
+def activity_get():
+    with _act_lock:
+        if ACTIVITY and time.time() - ACTIVITY.get('updated', 0) < ACTIVITY_TTL:
+            a = dict(ACTIVITY)
+            a['elapsed'] = int(time.time() - a['since'])
+            return a
+    return None
+
+
 def save_lastmodel(m, public):
     if not isinstance(m, dict) or not isinstance(m.get('groups'), list) or not isinstance(m.get('domains'), list):
         return False
@@ -861,6 +895,8 @@ class H(BaseHTTPRequestHandler):
             return self._json({'ok': True, 'job': job.snapshot(full=True)})
         if path == '/lastmodel':
             return self._json({'ok': True, 'model': load_lastmodel('priv')})
+        if path == '/activity':
+            return self._json({'ok': True, 'activity': activity_get()})
         if path == '/stats':
             return self._json({'ok': True, **HISTORY.stats(_days(self.path))})
         if path == '/history':
@@ -898,6 +934,8 @@ class H(BaseHTTPRequestHandler):
 
         if path == '/lastmodel':
             return self._json({'ok': save_lastmodel(body.get('model'), False)})
+        if path == '/activity':
+            return self._json({'ok': activity_set(body)})
 
         if path == '/exits/reset':
             return self._json({'ok': True, 'exits': reset_exits()})
@@ -1069,6 +1107,18 @@ def _fwd_ok(key):
         return True
 
 
+def _act_ok(client):
+    now = time.time()
+    with PUB['lock']:
+        hits = [t for t in PUB['hits'].get('act:' + client, []) if now - t < 60]
+        if len(hits) >= 40:
+            PUB['hits']['act:' + client] = hits
+            return False
+        hits.append(now)
+        PUB['hits']['act:' + client] = hits
+        return True
+
+
 class P(BaseHTTPRequestHandler):
     """Публичный обработчик: форма проверки и больше ничего. Слушает loopback, наружу его выводит Tailscale Funnel."""
     server_version = 'GeoCheck-public'
@@ -1125,6 +1175,8 @@ class P(BaseHTTPRequestHandler):
             return self._send({'ok': True, 'version': VERSION, 'public': True, 'exits': pub_exits_legacy()})
         if path == '/lastmodel':
             return self._send({'ok': True, 'model': load_lastmodel('pub')})
+        if path == '/activity':
+            return self._send({'ok': True, 'activity': activity_get()})
         if path == '/stats':
             dflt = [d.rstrip('/') for d in PUB_DEFAULT_TARGETS]
             st = HISTORY.stats(_days(self.path), only_target=lambda t, p: not p.get('public') or t.rstrip('/') in dflt)
@@ -1201,6 +1253,15 @@ class P(BaseHTTPRequestHandler):
             except Exception:
                 return self._send({'ok': False, 'error': 'bad json'}, 400)
             return self._send({'ok': save_lastmodel(body.get('model'), True)})
+        if path == '/activity':
+            if not _act_ok(self._client()):
+                return self._send({'ok': False}, 429)
+            try:
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                body = json.loads(self.rfile.read(min(n, 2000)) or b'{}')
+            except Exception:
+                return self._send({'ok': False}, 400)
+            return self._send({'ok': activity_set(body)})
         if path == '/jobs/cancel' or (path.startswith('/jobs/') and path.endswith('/cancel')):
             job = self._pub_job(path[6:-7].strip('/'))
             if not job:
