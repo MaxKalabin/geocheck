@@ -102,7 +102,7 @@ def test_reset_exits_clears_exclusion(daemon):
 
 def test_public_exits_has_no_secrets_fields(daemon):
     for e in daemon.public_exits():
-        assert set(e) <= {'id', 'label', 'port', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded'}
+        assert set(e) <= {'id', 'label', 'port', 'ok', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded'}
 
 
 def test_cancelled_job_stops_before_measuring(daemon):
