@@ -392,6 +392,7 @@ def control_check(ex):
             loc = line[4:]
     if ok:
         ex['fails'] = 0
+        ex['excluded'] = False
         ex['exit_ip'], ex['exit_loc'] = ip or ex.get('exit_ip', ''), loc
     else:
         ex['fails'] = ex.get('fails', 0) + 1
@@ -399,6 +400,12 @@ def control_check(ex):
             ex['excluded'] = True
     ex['ok'] = ok
     ex['geo'] = geo_verdict(ex.get('claimed', ''), loc if ok else '')
+    if ok:
+        ex['status'] = f"OK {r.get('ms')}мс · exit {ip or '?'} ({loc or '??'})"
+        if ex['geo'] == 'mismatch':
+            ex['status'] += f" · ⚠ заявлена {ex.get('claimed') or '?'}"
+    else:
+        ex['status'] = '⚠ мёртв — ' + ((r.get('error') or r.get('note') or 'нет ответа')[:120])
     return {'code': r.get('code', 0), 'ms': r.get('ms'), 'ip': ip, 'loc': loc, 'ok': ok,
             'error': (r.get('error') or r.get('note') or '')[:200] if not ok else '',
             'fails': ex['fails'], 'excluded': ex['excluded'], 'geo': ex['geo']}
@@ -408,7 +415,7 @@ def warmup():
     """Прогрев: контрольная проверка каждого живого выхода; отдаёт exit-IP и страну."""
     ensure_cores()
     with STATE['lock']:
-        exits = [e for e in STATE['exits'] if not e.get('excluded')]
+        exits = list(STATE['exits'])        # и исключённые: прогрев даёт им шанс вернуться
     with ThreadPoolExecutor(max_workers=16) as pool:
         futs = {ex['id']: pool.submit(control_check, ex) for ex in exits}
         return {eid: f.result() for eid, f in futs.items()}
@@ -864,6 +871,68 @@ def pub_view(job):
     return {'id': snap['id'], 'state': state, 'results': rows}
 
 
+PUB_EXIT_LABEL = 'Сервер проверки'
+
+
+def pub_exit():
+    return {'id': 'direct', 'label': PUB_EXIT_LABEL, 'country': None, 'source': 'local', 'status': 'up',
+            'exitIp': None, 'lastCheckAt': None, 'consecutiveFailures': 0, 'lastError': None}
+
+
+def pub_job_api(job):
+    """Задание для публичного дашборда: только прямой канал, без адресов выходов и внутренних параметров."""
+    out = apiv1.job_api(job.snapshot(full=True))
+    out['exits'] = [pub_exit()]
+    for r in out['results']:
+        r.update({'exitLabel': PUB_EXIT_LABEL, 'exitIp': None, 'country': None, 'exitId': 'direct'})
+    out['options'] = {}
+    out['warnings'] = []
+    return out
+
+
+PUB_CELL_DROP = ('error', 'headers', 'body')
+
+
+def pub_exits_legacy():
+    """VPN-выходы для публичной страницы: название и страна видны, IP/порты выходов — нет."""
+    out = []
+    for e in STATE['exits']:
+        if e.get('ok') is None:
+            st = ''
+        elif e.get('ok'):
+            st = f"OK · страна выхода {e.get('exit_loc') or '??'}" + (' · ⚠ не совпадает с заявленной' if e.get('geo') == 'mismatch' else '')
+        else:
+            st = '⚠ выход не отвечает'
+        out.append({'id': e['id'], 'label': PUB_EXIT_LABEL if e['id'] == 'direct' else e['label'],
+                    'ok': e.get('ok'), 'status': st, 'exit_loc': e.get('exit_loc'),
+                    'claimed': e.get('claimed'), 'geo': e.get('geo'), 'excluded': e.get('excluded')})
+    return out
+
+
+def pub_snapshot(job):
+    snap = job.snapshot(full=True)
+    res = {}
+    for eid, cells in snap['results'].items():
+        res[eid] = {t: {k: v for k, v in c.items() if k not in PUB_CELL_DROP} for t, c in cells.items()}
+    return {'id': snap['id'], 'status': snap['status'], 'progress': snap['progress'], 'targets': snap['targets'],
+            'results': res, 'summary': snap['summary'], 'exits': pub_exits_legacy(), 'warnings': []}
+
+
+FWD_LIMIT = (900, 3600)   # запросов на IP за час через /fwd
+
+
+def _fwd_ok(key):
+    now = time.time()
+    with PUB['lock']:
+        hits = [t for t in PUB['hits'].get('fwd:' + key, []) if now - t < FWD_LIMIT[1]]
+        if len(hits) >= FWD_LIMIT[0]:
+            PUB['hits']['fwd:' + key] = hits
+            return False
+        hits.append(now)
+        PUB['hits']['fwd:' + key] = hits
+        return True
+
+
 class P(BaseHTTPRequestHandler):
     """Публичный обработчик: форма проверки и больше ничего. Слушает loopback, наружу его выводит Tailscale Funnel."""
     server_version = 'GeoCheck-public'
@@ -880,32 +949,102 @@ class P(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('Content-Security-Policy',
-                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+                         "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:")
         self.end_headers()
         self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        return self._send(obj, code)
+
+    fwd_request = H.fwd_request   # только check-host.net и api.globalping.io
 
     def _client(self):
         xff = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
         return xff or self.client_address[0]
 
+    def _static(self, path):
+        name = 'index.html' if path in ('/', '') else path.lstrip('/')
+        if name not in STATIC_FILES:
+            return self._send({'error': 'unknown'}, 404)
+        try:
+            with open(os.path.join(ROOT, name), 'rb') as f:
+                return self._send(None, ctype=CTYPES.get(os.path.splitext(name)[1], 'application/octet-stream'),
+                                  raw=f.read())
+        except OSError:
+            return self._send({'error': 'unknown'}, 404)
+
+    def _pub_job(self, jid):
+        return JOBS.get(jid) if jid in PUB['jobs'] else None
+
     def do_GET(self):
         path = self.path.split('?', 1)[0]
-        if path in ('/', '/index.html'):
-            try:
-                with open(os.path.join(ROOT, 'public.html'), 'rb') as f:
-                    return self._send(None, ctype='text/html; charset=utf-8', raw=f.read())
-            except OSError:
-                return self._send({'error': 'unknown'}, 404)
+        if path in ('/', '') or path.lstrip('/') in STATIC_FILES:
+            return self._static(path)
+        if path == '/api/health':
+            return self._send({'ok': True, 'version': VERSION, 'public': True})
+        if path == '/status':
+            return self._send({'ok': True, 'version': VERSION, 'public': True, 'exits': pub_exits_legacy()})
+        if path.startswith('/fwd'):
+            if not _fwd_ok(self._client()):
+                return self._send({'ok': False, 'error': 'слишком много запросов'}, 429)
+            return self.fwd_request('GET')
+        if path.startswith('/jobs/'):
+            job = self._pub_job(path[6:].strip('/'))
+            if not job:
+                return self._send({'ok': False, 'error': 'нет такого задания'}, 404)
+            return self._send({'ok': True, 'job': pub_snapshot(job)})
+        if path == '/api/exits':
+            return self._send({'exits': [pub_exit()]})
+        if path == '/api/history':
+            return self._send({'jobs': []})
+        if path.startswith('/api/jobs/'):
+            job = self._pub_job(path[10:].strip('/'))
+            if not job:
+                return self._send({'error': 'нет такого задания'}, 404)
+            return self._send(pub_job_api(job))
         if path.startswith('/pub/job/'):
-            jid = path[9:].strip('/')
-            job = JOBS.get(jid) if jid in PUB['jobs'] else None
+            job = self._pub_job(path[9:].strip('/'))
             if not job:
                 return self._send({'error': 'нет такой проверки'}, 404)
             return self._send(pub_view(job))
         return self._send({'error': 'unknown'}, 404)
 
+    def _create(self, raw, browser=True, domain_first=False):
+        """Проверка входа и создание публичного задания → (job, None) или (None, (ответ, код))."""
+        targets, bad = _targets(list(raw)[:PUB_MAX_TARGETS + 5])
+        if not targets:
+            return None, ({'error': 'введите домен или адрес страницы'}, 400)
+        if len(targets) > PUB_MAX_TARGETS:
+            return None, ({'error': f'не больше {PUB_MAX_TARGETS} адресов за раз'}, 400)
+        for t in targets:
+            why = ssrf_reason(t)
+            if why:
+                return None, ({'error': f'{t}: {why}'}, 400)
+        with PUB['lock']:
+            ids = list(PUB['jobs'])
+        pending = sum(1 for j in ids if JOBS.get(j) and JOBS.get(j).status in ('queued', 'running'))
+        if pending >= PUB_MAX_PENDING:
+            return None, ({'error': 'сейчас очередь занята, попробуйте через минуту'}, 429)
+        if not pub_rate_ok(self._client()):
+            return None, ({'error': 'слишком много проверок, подождите несколько минут'}, 429)
+        job = JOBS.create(targets, {'browser': bool(browser), 'domainFirst': bool(domain_first),
+                                    'repeats': 1, 'public': True})
+        with PUB['lock']:
+            PUB['jobs'].add(job.id)
+        return job, None
+
     def do_POST(self):
-        if self.path.split('?', 1)[0] != '/pub/check':
+        path = self.path.split('?', 1)[0]
+        if path.startswith('/fwd'):
+            if not _fwd_ok(self._client()):
+                return self._send({'ok': False, 'error': 'слишком много запросов'}, 429)
+            return self.fwd_request('POST')
+        if path == '/jobs/cancel' or (path.startswith('/jobs/') and path.endswith('/cancel')):
+            job = self._pub_job(path[6:-7].strip('/'))
+            if not job:
+                return self._send({'ok': False, 'error': 'нет такого задания'}, 404)
+            return self._send({'ok': JOBS.cancel(job.id)})
+        if path not in ('/pub/check', '/api/jobs', '/jobs') and not (path.startswith('/api/jobs/') and path.endswith('/cancel')):
             return self._send({'error': 'unknown'}, 404)
         try:
             n = int(self.headers.get('Content-Length', '0') or 0)
@@ -914,28 +1053,29 @@ class P(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b'{}')
         except Exception:
             return self._send({'error': 'bad json'}, 400)
-        raw = body.get('targets') or []
+        if path.endswith('/cancel'):
+            job = self._pub_job(path[10:-7].strip('/'))
+            if not job:
+                return self._send({'error': 'нет такого задания'}, 404)
+            JOBS.cancel(job.id)
+            return self._send(pub_job_api(job))
+        if path == '/jobs':
+            raw = body.get('targets') or body.get('domains') or []
+            if isinstance(raw, str):
+                raw = raw.split()
+            job, err = self._create(raw, browser=body.get('browser', True), domain_first=body.get('domainFirst'))
+            if err:
+                return self._send({'ok': False, 'error': err[0].get('error')}, err[1])
+            return self._send({'ok': True, 'id': job.id, 'status': job.status, 'total': len(job.targets)}, 202)
+        raw = body.get('urls') if path == '/api/jobs' else body.get('targets')
+        raw = raw or []
         if isinstance(raw, str):
             raw = raw.split()
-        targets, bad = _targets(list(raw)[:PUB_MAX_TARGETS + 5])
-        if not targets:
-            return self._send({'error': 'введите домен или адрес страницы'}, 400)
-        if len(targets) > PUB_MAX_TARGETS:
-            return self._send({'error': f'не больше {PUB_MAX_TARGETS} адресов за раз'}, 400)
-        for t in targets:
-            why = ssrf_reason(t)
-            if why:
-                return self._send({'error': f'{t}: {why}'}, 400)
-        with PUB['lock']:
-            ids = list(PUB['jobs'])
-        pending = sum(1 for j in ids if JOBS.get(j) and JOBS.get(j).status in ('queued', 'running'))
-        if pending >= PUB_MAX_PENDING:
-            return self._send({'error': 'сейчас очередь занята, попробуйте через минуту'}, 429)
-        if not pub_rate_ok(self._client()):
-            return self._send({'error': 'слишком много проверок, подождите несколько минут'}, 429)
-        job = JOBS.create(targets, {'browser': False, 'repeats': 1, 'only': ['direct'], 'public': True})
-        with PUB['lock']:
-            PUB['jobs'].add(job.id)
+        job, err = self._create(raw)
+        if err:
+            return self._send(*err)
+        if path == '/api/jobs':
+            return self._send({'id': job.id, 'state': job.status}, 202)
         return self._send({'id': job.id}, 202)
 
 

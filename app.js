@@ -1,504 +1,1395 @@
-// GeoCheck dashboard. Talks only to the local daemon (docs/API.md); no external services from the browser.
-(() => {
+/* GeoCheck — логика дашборда.
+ * Внешние проверки: check-host.net API + GlobalPing API (из браузера, при неудаче — через демон).
+ * Локальные: демон 127.0.0.1 (daemon/checkdaemon.py) + браузерный no-cors пробник.
+ * Секреты (подписки) никогда не сохраняются; закрытая страница ходит к демону с токеном (X-RG-Token).
+ *
+ * Модель: lastModel = {at, domains, groups:[{id,title,rows:[{key,title,sub,cells:{di:cell},isMsg?}]}]}
+ * Выбор: rowSel {key:{c,f}}, domSel [0/1], hideUnchecked — в localStorage.
+ */
 'use strict';
 
-const SS_TOKEN = 'geocheck.token';   // sessionStorage only, and only when the user ticks "запомнить на вкладке"
-const LS_PREFS = 'geocheck.prefs';    // non-secret settings: urls, sources, repeats, apiBase
-const TERMINAL = new Set(['done', 'cancelled', 'failed']);
-
-// Cell statuses from docs/API.md. `tone` drives colour; FAILS are counted as failures (README table).
-const STATUS = {
-  'ok':             { label: 'ок', tone: 'ok' },
-  'slow':           { label: 'медленно', tone: 'warn' },
-  'challenge':      { label: 'CF-челлендж', tone: 'block' },
-  'blocked':        { label: 'отказ 4xx', tone: 'block' },
-  'server-error':   { label: '5xx', tone: 'err' },
-  'network-error':  { label: 'обрыв', tone: 'grey' },
-  'nginx-503':      { label: 'nginx 503 (антибот)', tone: 'block' },
-  'antibot-passed': { label: 'антибот: Send ок', tone: 'ok' },
-  'antibot-failed': { label: 'антибот: Send не прошёл', tone: 'err' },
-  'domain-down':    { label: 'домен не грузится', tone: 'grey' },
-  'exit-down':      { label: 'выход не работает', tone: 'dead' },
-  'pending':        { label: '…', tone: 'pending' },
-};
-const FAILS = new Set(['slow', 'challenge', 'blocked', 'server-error', 'network-error', 'antibot-failed', 'domain-down']);
-
-// Symptom text per dominant failure, taken from the README symptom table.
-const SYMPTOMS = {
-  'challenge':     '403 с cf-mitigated: CloudFlare-челлендж (бот-блок по гео, ASN или репутации IP)',
-  'server-error':  '5xx с CF-RAY: origin не отвечает или CF обрывает сессию',
-  'network-error': 'обрыв на TCP/TLS: режется сеть или выход, до CF не дошли',
-  'blocked':       '4xx-отказ: гео-политика CF или блок по ASN',
-  'slow':          'страница грузится дольше порога: медленный путь или перегруженный origin',
-  'antibot-failed':'заглушка антибота: после Send страница не открылась',
-  'domain-down':   'корень домена не открылся, страницы не проверялись',
-};
-const SOURCE_LABEL = { local: 'демон', 'check-host': 'check-host', globalping: 'GlobalPing', browser: 'браузер' };
-
-const st = {
-  token: '', base: '', jobId: null, job: null, timer: null, pollFails: 0,
-  connected: false, view: 'results',
+const LS_KEY = 'geocheck.settings.v2';
+const LS_HISTORY = 'geocheck.history.v1';
+const LS_LAST = 'geocheck.lastrun.v1';
+const LS_SEL = 'geocheck.sel.v1';
+const DEFAULTS = {
+  domains: [
+    'https://ru.restaurantguru.com/',
+    'https://restaurantguru.ru/',
+    'https://restaurantguru.com/',
+  ],
+  useCheckHost: true,
+  useGlobalPing: true,
+  useBrowser: true,
+  domainFirst: true,
+  slowMs: 10000,
+  maxNodes: 30,
+  daemonPort: 8787,
+  exitLabels: ['Этот ПК (системный канал)'],
 };
 
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const fmtMs = ms => (ms == null ? '' : ms >= 1000 ? (ms / 1000).toFixed(1) + ' с' : Math.round(ms) + ' мс');
-const shortUrl = u => { try { const x = new URL(u); return x.host + (x.pathname === '/' ? '' : x.pathname); } catch { return u; } };
-const clampInt = (v, lo, hi, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
+let PUBLIC = false;      // открыто снаружи: настройки, подписки, прогрев скрыты
+let settings = loadSettings();
+let runSeq = 0;
+let daemonExits = [];
+let lastModel = null;
+let lastAt = null;
+let spin = { local: false, ch: false, gp: false };
+let rowSel = {}, domSel = null, hideUnchecked = false, grpCol = {};
+let hideOkGlobal = false, grpHideOk = {};
+let grpDeadOpen = {};        // развёрнут ли блок «недоступные ноды» (сессия)
+let deletedRows = new Set(); // ноды, удалённые пользователем — не возвращаем
+let openDetailKey = null;   // какая нода сейчас раскрыта (детали строкой под ней)
+try {
+  const s = JSON.parse(localStorage.getItem(LS_SEL) || '{}');
+  rowSel = s.rowSel || {};
+  domSel = s.domSel || null;
+  hideUnchecked = !!s.hideUnchecked;
+  grpCol = s.grpCol || {};
+  hideOkGlobal = !!s.hideOkGlobal;
+  grpHideOk = s.grpHideOk || {};
+  deletedRows = new Set(s.deletedRows || []);
+} catch { }
 
-class ApiError extends Error {
-  constructor(kind, msg) { super(msg); this.kind = kind; }
-}
-
-async function api(path, opts = {}) {
-  const headers = { Accept: 'application/json' };
-  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
-  if (path !== '/api/health') headers['X-RG-Token'] = st.token;
-  let r;
+/* ---------------- утилиты ---------------- */
+function loadSettings() {
   try {
-    r = await fetch(st.base + path, {
-      method: opts.method || 'GET', body: opts.body, headers, cache: 'no-store',
-      signal: AbortSignal.timeout(opts.timeout || 15000),
-    });
-  } catch {
-    throw new ApiError('network', 'демон не отвечает');
-  }
-  if (r.status === 401) throw new ApiError('auth', 'токен не принят демоном');
-  if (!r.ok) {
-    let msg = 'HTTP ' + r.status;
-    try { msg = (await r.json()).error || msg; } catch { /* keep HTTP status */ }
-    throw new ApiError('http', msg);
-  }
-  return r.json();
+    const s = JSON.parse(localStorage.getItem(LS_KEY));
+    return { ...DEFAULTS, ...s, domains: (s && s.domains || DEFAULTS.domains).filter(Boolean) };
+  } catch { return { ...DEFAULTS }; }
+}
+function saveSettings() { localStorage.setItem(LS_KEY, JSON.stringify(settings)); }
+function shortDomain(u) {
+  try { const p = new URL(u); return p.host + (p.pathname !== '/' ? p.pathname : ''); }
+  catch { return u; }
+}
+function normUrl(u) { u = String(u || '').trim(); return !u ? '' : (/^[a-z][a-z0-9+.-]*:\/\//i.test(u) ? u : 'https://' + u); }
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function cellClass(code, c) {
+  if (c && c.hardBlock) return 'warn';
+  if (c && c.antibot) return c.captcha === 'failed' ? 'bad' : (c.ms > settings.slowMs ? 'warn' : 'redir');
+  if (c && c.engine === 'browser' && code && c.ms > settings.slowMs) return 'warn';
+  if (!code) return 'err';
+  if (code >= 200 && code < 300) return 'ok';
+  if (code >= 300 && code < 400) return 'redir';
+  if (code >= 400 && code < 500) return 'warn';
+  if (code >= 500) return 'bad';
+  return 'err';
+}
+function isFailed(c) { return !c || (!c.hardBlock && (!c.code || c.code >= 500 || (c.antibot && c.captcha === 'failed') || (c.engine === 'browser' && c.ms > settings.slowMs))); }
+function cellText(code, ms, note, c) {
+  if (c && c.hardBlock) return '⛔ nginx 503 (антибот)';
+  if (c && c.antibot && c.captcha === 'failed') return '🛡 Send не прошёл';
+  if (c && c.antibot) return `🛡 Send · ${((c.ms || 0) / 1000).toFixed(1)}s`;
+  if (c && c.skipped) return 'домен не грузится';
+  if (c && c.engine === 'browser' && code && ms > settings.slowMs) return `${code} · медленно ${(ms / 1000).toFixed(1)}s`;
+  if (!code) return `ERR${note ? ' · ' + note : ''}`;
+  const sec = (ms == null || isNaN(ms)) ? '' : ` · ${(ms / 1000).toFixed(2)}s`;
+  const tag = code === 403 ? ' ⚠CF' : '';
+  return `${code}${tag}${sec}`;
+}
+/* кто отдал ошибку: cf-ray есть — фронт CloudFlare (отсечение на CDN), нет — сам сайт */
+function errorOrigin(c) {
+  if (!c || !c.code) return '';
+  return c.cfRay ? 'cf' : 'origin';
+}
+function verdict(code, c) {
+  if (c && c.hardBlock) return 'жёсткий антибот сайта: nginx 503 Service Temporarily Unavailable — обходить нельзя, это не заглушка со Send';
+  if (c && c.antibot) return c.captcha === 'failed' ? 'заглушка со Send: после нажатия страница не открылась' : `заглушка со Send пройдена одним нажатием: заглушка ${((c.msLanding||0)/1000).toFixed(1)}s + загрузка после Send ${((c.msAfterCaptcha||0)/1000).toFixed(1)}s = ${((c.ms||0)/1000).toFixed(1)}s`;
+  if (c && c.skipped) return c.note;
+  if (c && c.engine === 'browser' && !c.code) return c.note || 'страница не грузится';
+  if (c && c.engine === 'browser' && c.ms > settings.slowMs) return `загрузилась, но очень долго: ${(c.ms / 1000).toFixed(1)} с (порог ${settings.slowMs / 1000} с)`;
+  const byCf = errorOrigin(c) === 'cf';
+  if (!code) return 'обрыв соединения / таймаут — нода или сеть недоступны';
+  if (code >= 200 && code < 300) return 'ок';
+  if (code >= 300 && code < 400) return 'редирект';
+  if (code === 403) return byCf
+    ? 'доступ запрещён фронтом CloudFlare — челлендж/бот-блок по IP/ASN; сам VPN жив, отсечение на CDN'
+    : 'доступ запрещён самим сайтом';
+  if (code >= 500) return byCf
+    ? `${code} отдал фронт CloudFlare (cf-ray есть) — отсечение на CDN по IP/ASN; VPN не виноват, сайт может быть жив`
+    : `${code} отдал сам сайт (ориджин, cf-ray отсутствует) — сервер недоступен или перегружен`;
+  return byCf ? 'клиентская ошибка от фронта CloudFlare' : 'клиентская ошибка от сайта';
 }
 
-/* ---------- connection ---------- */
-
-function setConn(tone, text) {
-  const el = $('daemonState');
-  el.className = 'conn conn-' + tone;
-  el.textContent = text;
+/* бейдж рядом с кодом: CF = ошибку отдал CloudFlare, «сайт» = ориджин (только где сняты заголовки) */
+function cellBadge(c, key) {
+  if (!c || !c.code || c.code < 400) return '';
+  if (c.cfRay)
+    return ' <span class="cfbadge" title="ошибку отдал фронт CloudFlare (cf-ray есть) — отсечение на CDN, VPN жив">CF</span>';
+  if (key.startsWith('daemon:') || key.startsWith('gp:') || key === 'local-browser')
+    return ' <span class="orgbadge" title="ошибку отдал сам сайт (ориджин) — cf-ray не выставлен">сайт</span>';
+  return '';
 }
 
-function setNotice(text, tone = '') {
-  const el = $('notice');
-  el.className = 'notice ' + (tone ? 'n-' + tone : '');
-  el.textContent = text;
+/* ---------------- журнал выполнения ---------------- */
+function setAction(t) {
+  const el = document.getElementById('lastAction');
+  if (el) el.textContent = t;
+}
+/* живой лоадер: крутилка + секунды, пока идёт прогон (пробники ждут до 60с) */
+let runTick = null;
+const SPIN_CHARS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+let spinIdx = 0;
+function startRunIndicator(label) {
+  stopRunIndicator();
+  const t0 = Date.now();
+  runTick = setInterval(() => {
+    const el = document.getElementById('lastAction');
+    if (el) el.textContent = `${SPIN_CHARS[spinIdx++ % SPIN_CHARS.length]} ${label} — идёт проверка, ${((Date.now() - t0) / 1000).toFixed(0)} с…`;
+    document.title = `⏳ ${((Date.now() - t0) / 1000).toFixed(0)} с · GeoCheck`;
+  }, 250);
+}
+function stopRunIndicator() {
+  if (runTick) { clearInterval(runTick); runTick = null; }
+  document.title = 'GeoCheck';
+}
+function log(msg, cls = '') {
+  const el = document.getElementById('log');
+  if (!el) return;
+  const t = new Date().toLocaleTimeString('ru-RU');
+  el.insertAdjacentHTML('beforeend',
+    `<div${cls ? ` class="${cls}"` : ''}><span class="t">${t}</span><span class="${cls}">${esc(msg)}</span></div>`);
+  while (el.children.length > 200) el.firstChild.remove();
+  el.scrollTop = el.scrollHeight;
 }
 
-function setButtons() {
-  const running = !!st.jobId;
-  $('btnStart').disabled = !st.connected || running;
-  $('btnCancel').disabled = !running;
-  const hasJob = !!st.job;
-  $('btnCsv').disabled = !hasJob;
-  $('btnJson').disabled = !hasJob;
+/* ---------------- выбор (чекбоксы/избранное) ---------------- */
+function selGet(key) { const s = rowSel[key]; return s ? s.c !== false : true; }
+function favGet(key) { const s = rowSel[key]; return !!(s && s.f); }
+function persistSel() {
+  localStorage.setItem(LS_SEL, JSON.stringify({ rowSel, domSel, hideUnchecked, grpCol, hideOkGlobal, grpHideOk, deletedRows: [...deletedRows] }));
+}
+function domChecked(i) { return !domSel || !!domSel[i]; }
+function activeDomainIdxs() { return settings.domains.map((_, i) => i).filter(domChecked); }
+
+/* «свернуть успешные»: точка считается успешной, если по ВСЕМ выбранным доменам
+   ответ 2xx/3xx; свёрнутые успешные исключаются из прогонов и перепроверок */
+function rowOk(r, diList) {
+  if (!diList.length) return false;
+  return diList.every(di => {
+    const c = r.cells[di];
+    if (!c || c.loading) return false;
+    const cls = cellClass(c.code, c);
+    return cls === 'ok' || cls === 'redir';
+  });
+}
+function groupIdOf(model, r) {
+  if (!model) return '';
+  for (const g of model.groups) if (g.rows.includes(r)) return g.id;
+  return '';
+}
+/* «мёртвая» нода: есть данные и по ВСЕМ выбранным доменам — обрыв соединения.
+   HTTP-ошибка (403/503 и т.п.) НЕ делает ноду мёртвой: сервер ответил — узел жив,
+   пусть и с ошибкой. Различие CF vs origin см. в cellBadge/verdict */
+function isDeadRow(r, doms) {
+  const checked = doms.map((_, di) => di).filter(domChecked);
+  const list = checked.length ? checked : doms.map((_, i) => i);
+  const cells = list.map(di => r.cells[di]);
+  if (!cells.some(c => c && !c.loading)) return false;
+  return cells.every(c => c && !c.loading && !c.code);   // код 0 = обрыв/таймаут
+}
+/* выход демона для daemon-строки */
+function daemonExitOf(key) {
+  if (!key || !key.startsWith('daemon:')) return null;
+  return daemonExits.find(e => e.id === key.slice(7)) || null;
+}
+/* по результатам прогрева выход помечен мёртвым («⚠ мёртв — …») */
+function isWarmupDead(r) {
+  const ex = daemonExitOf(r.key);
+  return !!(ex && String(ex.status || '').startsWith('⚠'));
+}
+function isRowOkHidden(model, r) {
+  if (!model || r.isMsg) return false;
+  const gid = groupIdOf(model, r);
+  if (!(hideOkGlobal || grpHideOk[gid])) return false;
+  return rowOk(r, activeDomainIdxs());
 }
 
-async function connect() {
-  st.token = $('token').value.trim();
-  st.base = $('apiBase').value.trim().replace(/\/+$/, '');
-  if (st.token && $('rememberToken').checked) sessionStorage.setItem(SS_TOKEN, st.token);
-  else sessionStorage.removeItem(SS_TOKEN);
-  savePrefs();
-  st.connected = false; setButtons();
-  if (!st.token) { setConn('grey', 'нужен токен'); return; }
-  setConn('grey', 'проверяю…');
-  try {
-    await api('/api/health');
-    const { exits } = await api('/api/exits');
-    st.connected = true;
-    const up = exits.filter(e => e.status === 'up').length;
-    const down = exits.filter(e => e.status === 'down').length;
-    setConn('ok', `демон на связи · выходов: ${up} работают${down ? ', ' + down + ' не работают' : ''}`);
-    if (!st.job) renderDeadExits(exits);
-  } catch (e) {
-    setConn('err', e.kind === 'auth' ? 'токен не принят' : e.message);
-  }
-  setButtons();
-}
-
-/* ---------- start, poll, cancel ---------- */
-
-function parseUrls(text) {
-  const out = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const u = raw.trim();
-    if (u && !out.includes(u)) out.push(u);
-  }
-  return out;
-}
-
-async function startJob() {
-  const urls = parseUrls($('urls').value);
-  if (!urls.length) return setNotice('введите хотя бы один адрес', 'err');
-  for (const u of urls) {
-    let ok = false;
-    try { const x = new URL(u); ok = x.protocol === 'http:' || x.protocol === 'https:'; } catch { /* not a URL */ }
-    if (!ok) return setNotice('не похоже на адрес http(s): ' + u, 'err');
-  }
-  if (urls.length > 50) return setNotice('не больше 50 адресов за один прогон', 'err');
-  const sources = {
-    localExits: $('srcLocal').checked, checkHost: $('srcCheckHost').checked,
-    globalPing: $('srcGlobalPing').checked, browser: $('srcBrowser').checked,
+/* ---------------- таймер паузы между прогонами (не бомбим сервисы проверок) ---------------- */
+const PACE_MIN_MS = 20000;
+let paceNextAt = 0, paceTick = null;
+function paceRun(label, fn) {
+  const wait = paceNextAt - Date.now();
+  const start = () => {
+    paceNextAt = Date.now() + PACE_MIN_MS;
+    if (paceTick) { clearInterval(paceTick); paceTick = null; }
+    fn();
   };
-  if (!Object.values(sources).some(Boolean)) return setNotice('выберите хотя бы один источник', 'err');
-  const body = {
-    urls, sources,
-    repeats: clampInt($('repeats').value, 1, 3, 3),
-    domainFirst: $('domainFirst').checked,
-    maxNodes: clampInt($('maxNodes').value, 5, 40, 20),
+  if (wait <= 0) { start(); return; }
+  const secs = Math.ceil(wait / 1000);
+  log(`⏱ ${label}: пауза ${secs} с — не бомбим сервисы проверок`);
+  let left = secs;
+  setAction(`⏱ ${label} через ${left} с…`);
+  if (paceTick) clearInterval(paceTick);
+  paceTick = setInterval(() => {
+    left--;
+    if (left <= 0) { start(); return; }
+    setAction(`⏱ ${label} через ${left} с…`);
+  }, 1000);
+}
+
+/* ---------------- домены ---------------- */
+function renderDomains() {
+  const bar = document.getElementById('domainsBar');
+  bar.innerHTML = settings.domains.map((d, i) =>
+    `<span class="chip ${domChecked(i) ? 'active' : 'dim'}">${esc(shortDomain(d))}<span class="x" data-i="${i}" title="убрать из списка">✕</span></span>`
+  ).join('') + `<span class="chip" id="chipAdd" title="добавить домен">＋ домен</span>`;
+  bar.querySelectorAll('.x').forEach(x => x.onclick = e => {
+    e.stopPropagation();
+    settings.domains.splice(+x.dataset.i, 1);
+    domSel = null;
+    saveSettings(); persistSel(); renderDomains(); renderRows(lastModel);
+  });
+  document.getElementById('chipAdd').onclick = () => {
+    const v = normUrl(prompt('Домен или адрес страницы (например example.com):'));
+    if (v) { settings.domains.push(v); domSel = null; saveSettings(); persistSel(); renderDomains(); renderRows(lastModel); }
   };
-  savePrefs();
-  setNotice('');
-  try {
-    const r = await api('/api/jobs', { method: 'POST', body: JSON.stringify(body) });
-    st.job = null;
-    st.jobId = r.id;
-    st.pollFails = 0;
-    setButtons();
-    setNotice('проверка поставлена в очередь', 'ok');
-    tick();
-  } catch (e) {
-    setNotice('не запустилось: ' + e.message, 'err');
-  }
 }
 
-async function cancelJob() {
-  if (!st.jobId) return;
-  $('btnCancel').disabled = true;
-  try {
-    await api(`/api/jobs/${encodeURIComponent(st.jobId)}/cancel`, { method: 'POST' });
-    setNotice('отмена отправлена, частичные результаты сохранятся');
-  } catch (e) {
-    setNotice('отмена не прошла: ' + e.message, 'err');
-    $('btnCancel').disabled = false;
-  }
+/* ---------------- модель и рендер ---------------- */
+function freshModel() {
+  return {
+    at: Date.now(), domains: settings.domains.slice(),
+    groups: [
+      { id: 'local', title: 'Локально', rows: [] },
+      { id: 'ch', title: 'check-host.net', rows: [] },
+      { id: 'gp', title: 'GlobalPing', rows: [] },
+    ],
+  };
 }
-
-async function tick() {
-  clearTimeout(st.timer);
-  const id = st.jobId;
-  if (!id) return;
-  try {
-    const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
-    if (id !== st.jobId) return;            // another job was started meanwhile
-    st.pollFails = 0;
-    st.job = job;
-    render();
-    if (TERMINAL.has(job.state)) return finish(job);
-  } catch (e) {
-    if (id !== st.jobId) return;
-    st.pollFails++;
-    setNotice(`опрос не удался (${st.pollFails}/5): ${e.message}`, 'err');
-    if (st.pollFails >= 5 || e.kind === 'auth') {
-      st.jobId = null; setButtons();
-      return;
+function getGroup(model, id) { return model.groups.find(g => g.id === id); }
+function getRow(model, key) {
+  for (const g of model.groups) { const r = g.rows.find(r => r.key === key); if (r) return r; }
+  return null;
+}
+function addRow(model, gid, row) { getGroup(model, gid).rows.push(row); return row; }
+function addMsg(model, gid, text) {
+  return addRow(model, gid, { key: 'msg' + Math.random(), title: text, isMsg: true, isPending: true, cells: {} });
+}
+function dropMsg(model, r) {
+  for (const g of model.groups) { const i = g.rows.indexOf(r); if (i > -1) { g.rows.splice(i, 1); return; } }
+}
+function markLoading(model, diList, rowFilter) {
+  for (const g of model.groups) {
+    for (const r of g.rows) {
+      if (r.isMsg) { r.isPending = true; continue; }
+      if (rowFilter && !rowFilter.has(r.key)) continue;
+      if (!selGet(r.key)) continue;
+      if (!rowFilter && isRowOkHidden(lastModel, r)) continue;  // успешные свёрнуты — не трогаем
+      diList.forEach(di => r.cells[di] = { loading: true });
     }
   }
-  st.timer = setTimeout(tick, 1500);
 }
 
-function finish(job) {
-  st.jobId = null;
-  setButtons();
-  const map = {
-    done: ['готово: прогон завершён', 'ok'],
-    cancelled: ['отменено: сохранены частичные результаты', 'warn'],
-    failed: ['ошибка: ' + (job.error || 'причина не указана'), 'err'],
-  };
-  const [text, tone] = map[job.state] || ['завершено', ''];
-  setNotice(text, tone);
-  renderProgress(job);
+function cntHtml(t) {
+  return `<b class="c-ok">${t.ok}</b> <b class="c-warn">${t.warn}</b> <b class="c-err">${t.err}</b> <b class="c-na">${t.na}</b>`;
 }
 
-/* ---------- derived data ---------- */
+function renderRows(model) {
+  const t = document.getElementById('matrix');
+  const doms = model ? model.domains : settings.domains;
+  const groups = model ? model.groups : [];
+  const nCols = doms.length + 1;
 
-function buildRows(job) {
-  const map = new Map();
-  for (const e of job.exits || []) {
-    map.set(`${e.source}|${e.id}`, { key: `${e.source}|${e.id}`, label: e.label || e.id, country: e.country, source: e.source, exitIp: e.exitIp, status: e.status || 'unknown' });
+  // счётчики по доменам
+  const tall = doms.map(() => ({ ok: 0, warn: 0, err: 0, na: 0 }));
+  if (model) {
+    for (const g of groups) for (const r of g.rows) {
+      if (r.isMsg) continue;
+      doms.forEach((_, di) => {
+        const c = r.cells[di];
+        if (!c) { tall[di].na++; return; }
+        const cls = c.loading ? 'na' : cellClass(c.code, c);
+        if (cls === 'ok' || cls === 'redir') tall[di].ok++;
+        else if (cls === 'warn') tall[di].warn++;
+        else if (cls === 'na') tall[di].na++;
+        else tall[di].err++;
+      });
+    }
   }
-  for (const c of job.results || []) {
-    const key = `${c.source}|${c.exitId}`;
-    if (!map.has(key)) map.set(key, { key, label: c.exitLabel || c.exitId, country: c.country, source: c.source, exitIp: c.exitIp, status: 'unknown' });
+  // все ключи строк для мастер-чекбокса
+  const allKeys = [];
+  if (model) for (const g of groups) for (const r of g.rows) if (!r.isMsg) allKeys.push(r.key);
+  const checkedCnt = allKeys.filter(selGet).length;
+  const allOn = allKeys.length > 0 && checkedCnt === allKeys.length;
+
+  let h = '<thead><tr class="head-row"><th class="sel-head"><label class="cbline"><input type="checkbox" id="cbAll" ' +
+    (allOn ? 'checked' : '') + '> Точка наблюдения</label>' +
+    '<div class="prov"><a href="#" id="lnkAll">все</a> · <a href="#" id="lnkNone">никто</a>' +
+    (checkedCnt !== allKeys.length ? ` · выбрано ${checkedCnt}/${allKeys.length}` : '') + '</div>' +
+    `<label class="cbline hokg" title="свернуть точки, у которых все выбранные домены отвечают успешно (2xx/3xx); такие точки исключаются из прогонов"><input type="checkbox" id="cbHideOk"${hideOkGlobal ? ' checked' : ''}> свернуть успешные</label></th>`;
+  h += doms.map((d, di) =>
+    `<th class="${domChecked(di) ? '' : 'dim'}"><label class="cbline"><input type="checkbox" class="domcb" data-d="${di}" ${domChecked(di) ? 'checked' : ''}> ${esc(shortDomain(d))}</label><div class="cnt" title="ок / предупр. / ошибок / нет данных">${model ? cntHtml(tall[di]) : ''}</div></th>`
+  ).join('') + '</tr></thead><tbody>';
+
+  // избранные сверху
+  const favRows = [];
+  if (model) for (const g of groups) for (const r of g.rows) {
+    if (!r.isMsg && favGet(r.key) && selGet(r.key)) favRows.push(r);
   }
-  const rows = [...map.values()];
-  rows.sort((a, b) => (a.status === 'down') - (b.status === 'down') || a.source.localeCompare(b.source) || a.label.localeCompare(b.label));
-  return rows;
-}
+  const sections = [];
+  if (favRows.length) sections.push({ id: 'fav', title: '⭐ Избранные', rows: favRows });
+  if (model) for (const g of groups) sections.push(g);
 
-function cellIndex(job) {
-  const idx = new Map();
-  for (const c of job.results || []) idx.set(c.url + '\n' + c.source + '|' + c.exitId, c);
-  return idx;
-}
-
-function verdictFor(job, url, rows, idx) {
-  const liveRows = rows.filter(r => r.status !== 'down');
-  const cells = liveRows.map(r => idx.get(url + '\n' + r.key)).filter(Boolean);
-  const live = cells.filter(c => c.status !== 'pending' && c.status !== 'exit-down');
-  const dead = rows.filter(r => r.status === 'down').length;
-  const running = !!st.jobId;
-  if (!live.length) {
-    return { tone: 'muted', head: running ? 'считается…' : 'нет измерений', detail: dead ? `${dead} выходов не работают — в вердикт не входят` : '', counts: {} };
+  for (const g of sections) {
+    const dataRows = g.rows.filter(r => !r.isMsg && !deletedRows.has(r.key));
+    const okHiddenRows = dataRows.filter(r => isRowOkHidden(model, r));
+    const visRows = dataRows.filter(r => !okHiddenRows.includes(r));
+    // мёртвые (недоступные) — вниз, серые; живые — сверху.
+    // Мёртвыми считаются и обрывы по ячейкам, и ноды, помеченные прогревом «⚠ мёртв»
+    const aliveRows = [], deadRows = [];
+    for (const r of visRows) (isDeadRow(r, doms) || isWarmupDead(r) ? deadRows : aliveRows).push(r);
+    // доступные — наверх: сначала точки с успешными ответами (2xx/3xx) или OK по прогреву
+    const chkD = doms.map((_, di) => di).filter(domChecked);
+    const listD = chkD.length ? chkD : doms.map((_, i) => i);
+    const rowRank = r => {
+      if (listD.some(di => { const c = r.cells[di]; return c && !c.loading && c.code >= 200 && c.code < 400; })) return 0;
+      const ex = daemonExitOf(r.key);
+      return (ex && String(ex.status || '').startsWith('OK')) ? 0 : 1;
+    };
+    aliveRows.sort((a, b) => rowRank(a) - rowRank(b));
+    // счётчики ok/warn/err/na по каждому домену — только по живым видимым точкам
+    const gt = doms.map(() => ({ ok: 0, warn: 0, err: 0, na: 0 }));
+    for (const r of aliveRows) {
+      doms.forEach((_, di) => {
+        const c = r.cells[di];
+        if (!c) { gt[di].na++; return; }
+        const cls = c.loading ? 'na' : cellClass(c.code, c);
+        if (cls === 'ok' || cls === 'redir') gt[di].ok++;
+        else if (cls === 'warn') gt[di].warn++;
+        else if (cls === 'na') gt[di].na++;
+        else gt[di].err++;
+      });
+    }
+    const failedCnt = aliveRows.filter(r => doms.some((_, di) => r.cells[di] && isFailed(r.cells[di]))).length;
+    const col = !!grpCol[g.id];
+    // строка группы: ячейка управления + счётчики РОВНО под колонками доменов
+    h += `<tr class="group">` +
+      `<td class="gh-cell">` +
+      `<button class="caret" data-collapse="${esc(g.id)}" title="свернуть/развернуть группу">${col ? '▸' : '▾'}</button>` +
+      `<span class="gtitle">${esc(g.title)}</span>` +
+      (g.id !== 'fav' ? `<button class="btn mini" data-recheck="${esc(g.id)}" title="перепроверить все точки источника">↻ все</button>` : '') +
+      (g.id !== 'fav' && failedCnt ? `<button class="btn mini" data-recheckfailed="${esc(g.id)}" title="перепроверить только упавшие точки этой группы">⟳ упавшие (${failedCnt})</button>` : '') +
+      `<span class="spin ${spin[g.id] ? '' : 'hidden'}">⟳</span>` +
+      `<span class="gsub">${visRows.length} точек</span>` +
+      `<label class="grphok" title="свернуть успешные точки этой группы (из прогонов исключаются)"><input type="checkbox" class="grphideok" data-g="${esc(g.id)}"${grpHideOk[g.id] ? ' checked' : ''}> успешные</label>` +
+      `</td>` +
+      doms.map((d, di) => `<td class="gh-cnt" title="${esc(shortDomain(d))} — ок/предупр./ошибок/нет данных">${cntHtml(gt[di])}</td>`).join('') +
+      `</tr>`;
+    if (col) {
+      h += `<tr class="msg"><td colspan="${nCols}"><a href="#" class="lnkOff" data-g="${esc(g.id)}">▸ группа свёрнута: ${dataRows.length} точек — развернуть</a></td></tr>`;
+      continue;
+    }
+    let offRows = [];
+    for (const r of g.rows) {
+      if (deletedRows.has(r.key)) continue;
+      if (r.isMsg) {
+        h += `<tr class="msg${r.isPending ? ' pending' : ''}"><td colspan="${nCols}">${esc(r.title)}` +
+          (r.retry ? ` <button class="btn mini" data-msgretry="${esc(r.retry)}" title="повторить проверку этого источника">↻ повторить</button>` : '') +
+          `</td></tr>`;
+        continue;
+      }
+      if (hideUnchecked && !selGet(r.key)) { offRows.push(r); continue; }
+      if (okHiddenRows.includes(r)) continue;
+      if (deadRows.includes(r)) continue;
+      h += rowHtml(r, doms);
+      if (openDetailKey === r.key) h += detailRowHtml(r, doms, nCols);
+    }
+    // блок недоступных: >5 — схлопывается в одну строку
+    if (deadRows.length) {
+      if (deadRows.length > 5 && !grpDeadOpen[g.id]) {
+        h += `<tr class="msg dead-line"><td colspan="${nCols}"><button type="button" class="btn mini lnkDead" data-g="${esc(g.id)}">⚠ недоступные ноды (${deadRows.length}) — развернуть</button></td></tr>`;
+      } else {
+        for (const r of deadRows) {
+          h += rowHtml(r, doms, true);
+          if (openDetailKey === r.key) h += detailRowHtml(r, doms, nCols);
+        }
+        if (deadRows.length > 5) {
+          h += `<tr class="msg dead-line"><td colspan="${nCols}"><button type="button" class="btn mini lnkDead" data-g="${esc(g.id)}">▾ свернуть недоступные (${deadRows.length})</button></td></tr>`;
+        }
+      }
+    }
+    if (okHiddenRows.length) {
+      h += `<tr class="msg ok-line"><td colspan="${nCols}"><a href="#" class="lnkOk" data-g="${esc(g.id)}">✓ ${okHiddenRows.length} успешных свёрнуто — развернуть (перепроверка не нужна)</a></td></tr>`;
+    }
+    if (offRows.length && hideUnchecked) {
+      h += `<tr class="msg"><td colspan="${nCols}"><a href="#" class="lnkOff" data-g="${esc(g.id)}">▸ ${offRows.length} невыбранных — развернуть</a></td></tr>`;
+    }
   }
-  const counts = {};
-  for (const c of live) counts[c.status] = (counts[c.status] || 0) + 1;
-  const fails = live.filter(c => FAILS.has(c.status));
-  const extra = [];
-  if (dead) extra.push(`${dead} выход(ов) не работают — вне вердикта`);
-  if (counts['nginx-503']) extra.push(`nginx 503 у ${counts['nginx-503']}: жёсткий антибот, сбоем не считается`);
-  if (!fails.length) {
-    return { tone: 'ok', head: `доступен: ${live.length} замеров без сбоя`, detail: extra.join('; '), counts };
+  t.innerHTML = h + '</tbody>';
+  wireTableEvents(t, model, allKeys);
+}
+
+function rowHtml(r, doms, dead = false) {
+  const on = selGet(r.key);
+  // реальный IP, который выход отдаёт в интернет (после «♨ Прогрев VPN»)
+  let exip = '';
+  if (r.key.startsWith('daemon:')) {
+    const ex = daemonExits.find(e => e.id === r.key.slice(7));
+    if (ex && ex.exit_ip) exip = ` <span class="exip" title="exit-IP, видимый из интернета">${esc(ex.exit_ip)}${ex.exit_loc ? ' · ' + esc(ex.exit_loc) : ''}</span>`;
   }
-  const dominant = Object.keys(counts).filter(s => FAILS.has(s)).sort((a, b) => counts[b] - counts[a])[0];
-  let detail = SYMPTOMS[dominant] || '';
-  const failC = [...new Set(fails.map(c => c.country).filter(Boolean))];
-  const okC = [...new Set(live.filter(c => !FAILS.has(c.status)).map(c => c.country).filter(Boolean))];
-  const geoLike = dominant === 'challenge' || dominant === 'blocked';
-  if (geoLike && failC.length && okC.length && !failC.some(c => okC.includes(c))) {
-    detail += `. Проходит в ${okC.join(', ')}, не проходит в ${failC.join(', ')}: похоже на гео-политику`;
-  }
-  if (extra.length) detail += '. ' + extra.join('; ');
-  const share = fails.length / live.length;
-  return {
-    tone: share >= 0.5 ? 'err' : 'warn',
-    head: `сбои: ${fails.length} из ${live.length} замеров`,
-    detail, counts,
-  };
-}
-
-/* ---------- rendering ---------- */
-
-function renderProgress(job) {
-  const p = job.progress || { done: 0, total: 0 };
-  const pct = p.total ? Math.min(100, Math.round(p.done * 100 / p.total)) : (TERMINAL.has(job.state) ? 100 : 0);
-  $('progBar').style.width = pct + '%';
-  const stateTxt = { queued: 'в очереди', running: 'идёт', done: 'готово', cancelled: 'отменено', failed: 'ошибка' }[job.state] || job.state;
-  $('progText').textContent = `${stateTxt}: ${p.done ?? 0} из ${p.total ?? 0}${p.stage ? ' · ' + p.stage : ''}`;
-}
-
-function renderDeadExits(exits) {
-  const box = $('deadExits');
-  const down = (exits || []).filter(e => e.status === 'down');
-  if (!down.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
-  box.classList.remove('hidden');
-  box.innerHTML = `<h3>Выходы не работают: ${down.length} (контрольный сайт не открылся, в вердикты не входят)</h3>` +
-    '<ul>' + down.map(e => `<li><b>${esc(e.label || e.id)}</b> ${esc(e.country || '')} ${e.lastError ? '<span class="muted">· ' + esc(e.lastError) + '</span>' : ''}</li>`).join('') + '</ul>';
-}
-
-function renderVerdicts(job, rows, idx) {
-  const el = $('verdicts');
-  if (!job.urls || !job.urls.length) { el.innerHTML = ''; return; }
-  el.innerHTML = job.urls.map(url => {
-    const v = verdictFor(job, url, rows, idx);
-    const chips = Object.entries(v.counts).map(([s, n]) => `<span class="chip chip-${STATUS[s]?.tone || 'grey'}">${esc(STATUS[s]?.label || s)} ${n}</span>`).join('');
-    return `<article class="verdict v-${v.tone}">
-      <h3 title="${esc(url)}">${esc(shortUrl(url))}</h3>
-      <p class="v-head">${esc(v.head)}</p>
-      ${v.detail ? `<p class="v-detail">${esc(v.detail)}</p>` : ''}
-      <div class="chips">${chips}</div>
-    </article>`;
+  let h = `<tr class="${dead ? 'row-dead' : on ? '' : 'row-off'}" data-k="${esc(r.key)}">`;
+  h += `<td class="node"><div class="rowctl">` +
+    `<input type="checkbox" class="rowcb" data-k="${esc(r.key)}" ${on ? 'checked' : ''} title="участвует в прогоне">` +
+    `<button class="star retry" data-retry="${esc(r.key)}" title="перепроверить только эту точку">⟳</button>` +
+    `<button class="star ${favGet(r.key) ? 'on' : ''}" data-k="${esc(r.key)}" title="в избранное">${favGet(r.key) ? '★' : '☆'}</button>` +
+    (dead ? `<button class="star del" data-delrow="${esc(r.key)}" title="удалить ноду из списка">✕</button>` : '') +
+    `</div><div class="ntext">${esc(r.title)}${exip}<div class="prov">${esc(r.sub || '')}</div></div></td>`;
+  h += doms.map((_, di) => {
+    const c = r.cells[di];
+    const rb = `<button class="cellretry" data-k="${esc(r.key)}" data-d="${di}" title="перепроверить только эту ячейку">⟳</button>`;
+    if (!c) return `<td><span class="cellwrap"><span class="cell empty" title="не участвует в прогоне / не проверялось">—</span>${rb}</span></td>`;
+    if (c.loading) return `<td><span class="cellwrap"><span class="cell loading">…</span>${rb}</span></td>`;
+    const cls = cellClass(c.code, c);
+    return `<td><span class="cellwrap"><span class="cell ${cls}" data-k="${esc(r.key)}" data-d="${di}">${esc(cellText(c.code, c.ms, c.note, c))}</span>${cellBadge(c, r.key)}${rb}</span></td>`;
   }).join('');
+  return h + '</tr>';
 }
 
-function cellHtml(c, job) {
-  if (!c) {
-    const txt = job.state && TERMINAL.has(job.state) ? '—' : '…';
-    return `<td class="cell st-pending" title="не измерено"><span class="cl">${txt}</span></td>`;
-  }
-  const meta = STATUS[c.status] || { label: c.status, tone: 'grey' };
-  const sub = [c.code ? c.code : '', c.ms != null ? fmtMs(c.ms) : ''].filter(Boolean).join(' · ');
-  const reps = (c.repeats || []).map(r => `${r.code || '—'} ${fmtMs(r.ms) || ''} ${STATUS[r.status]?.label || r.status}`).join(' | ');
-  const title = [reps && 'повторы: ' + reps, c.cfRay && 'CF-RAY ' + c.cfRay, c.note, c.error].filter(Boolean).join(' · ');
-  return `<td class="cell st-${meta.tone}" title="${esc(title)}"><span class="cl">${esc(meta.label)}</span>${sub ? `<small>${esc(sub)}</small>` : ''}</td>`;
-}
-
-function renderMatrix(job, rows, idx) {
-  const t = $('matrix');
-  if (!job.urls || !job.urls.length) { t.innerHTML = '<tr><td class="empty">здесь появятся результаты после запуска</td></tr>'; return; }
-  const head = '<thead><tr><th scope="col">выход</th>' +
-    job.urls.map(u => `<th scope="col" title="${esc(u)}">${esc(shortUrl(u))}</th>`).join('') + '</tr></thead>';
-  const live = rows.filter(r => r.status !== 'down');
-  const dead = rows.filter(r => r.status === 'down');
-  const rowHtml = r => `<tr class="${r.status === 'down' ? 'dead-row' : ''}"><th scope="row">${esc(r.label)}<small>${esc(r.country || '')} · ${esc(SOURCE_LABEL[r.source] || r.source)}${r.exitIp ? ' · ' + esc(r.exitIp) : ''}</small></th>` +
-    job.urls.map(u => cellHtml(idx.get(u + '\n' + r.key), job)).join('') + '</tr>';
-  let body = live.map(rowHtml).join('');
-  if (dead.length) {
-    body += `<tr class="group"><th colspan="${job.urls.length + 1}">выходы не работают: не входят в вердикт</th></tr>`;
-    body += dead.map(r => rowHtml({ ...r, status: 'down' })).join('');
-  }
-  if (!live.length && !dead.length) body = `<tr><td class="empty" colspan="${job.urls.length + 1}">выходов пока нет</td></tr>`;
-  t.innerHTML = head + '<tbody>' + body + '</tbody>';
-}
-
-function renderMirrors(job, rows, idx) {
-  const el = $('mirrors');
-  if (!job.urls || job.urls.length < 2) {
-    el.innerHTML = '<p class="empty">Добавьте два и больше адресов-зеркал (например .com, ru. и .ru), чтобы увидеть расхождения.</p>';
-    return;
-  }
-  const live = rows.filter(r => r.status !== 'down');
-  let diverge = 0;
-  const body = live.map(r => {
-    const cells = job.urls.map(u => idx.get(u + '\n' + r.key));
-    const measured = cells.filter(c => c && c.status !== 'pending' && c.status !== 'exit-down');
-    const flags = new Set(measured.map(c => FAILS.has(c.status)));
-    const div = flags.size > 1;
-    if (div) diverge++;
-    return `<tr class="${div ? 'diverge' : ''}"><th scope="row">${esc(r.label)}<small>${esc(r.country || '')} · ${esc(SOURCE_LABEL[r.source] || r.source)}</small></th>` +
-      cells.map(c => cellHtml(c, job)).join('') +
-      `<td class="flag">${div ? 'расходятся' : (measured.length ? 'одинаково' : '')}</td></tr>`;
-  }).join('');
-  el.innerHTML = `<p class="v-head">Расходятся на ${diverge} из ${live.length} выходов: одно зеркало открывается, другое нет. Такие строки подсвечены.</p>
-    <div class="table-wrap"><table aria-label="сравнение зеркал"><thead><tr><th scope="col">выход</th>` +
-    job.urls.map(u => `<th scope="col" title="${esc(u)}">${esc(shortUrl(u))}</th>`).join('') +
-    '<th scope="col">итог</th></tr></thead><tbody>' + body + '</tbody></table></div>';
-}
-
-function render() {
-  const job = st.job;
-  if (!job) return;
-  renderProgress(job);
-  const rows = buildRows(job);
-  const idx = cellIndex(job);
-  renderDeadExits(job.exits || []);
-  renderVerdicts(job, rows, idx);
-  renderMatrix(job, rows, idx);
-  renderMirrors(job, rows, idx);
-  setButtons();
-}
-
-async function renderHistory() {
-  const el = $('history');
-  el.innerHTML = '<p class="empty">загружаю…</p>';
-  try {
-    const { jobs } = await api('/api/history?limit=50');
-    if (!jobs.length) { el.innerHTML = '<p class="empty">прогонов пока нет</p>'; return; }
-    el.innerHTML = '<ul class="hist-list">' + jobs.map(j => {
-      const s = j.summary || {};
-      const when = j.createdAt ? new Date(j.createdAt).toLocaleString() : '';
-      const stateTxt = { done: 'готово', cancelled: 'отменено', failed: 'ошибка', running: 'идёт', queued: 'в очереди' }[j.state] || j.state;
-      return `<li><button class="hist-item" data-id="${esc(j.id)}">
-        <span class="hi-when">${esc(when)}</span>
-        <span class="hi-urls">${esc((j.urls || []).map(shortUrl).join(', '))}</span>
-        <span class="hi-meta">${esc(stateTxt)}${s.cells != null ? ` · замеров ${s.cells}, сбоев ${s.failures ?? 0}` : ''}</span></button></li>`;
-    }).join('') + '</ul>';
-  } catch (e) {
-    el.innerHTML = `<p class="empty">история недоступна: ${esc(e.message)}</p>`;
-  }
-}
-
-async function loadJob(id) {
-  setNotice('открываю прогон…');
-  try {
-    const job = await api(`/api/history/${encodeURIComponent(id)}`);
-    st.jobId = null;
-    st.job = job;
-    setNotice('прогон открыт из истории', 'ok');
-    showView('results');
-    render();
-  } catch (e) {
-    setNotice('не открылось: ' + e.message, 'err');
-  }
-}
-
-function showView(name) {
-  st.view = name;
-  document.querySelectorAll('.tab').forEach(b => {
-    const on = b.dataset.view === name;
-    b.classList.toggle('active', on);
-    b.setAttribute('aria-selected', on ? 'true' : 'false');
+function wireTableEvents(t, model, allKeys) {
+  t.querySelectorAll('.rowcb').forEach(cb => cb.onchange = () => {
+    const k = cb.dataset.k;
+    rowSel[k] = { ...(rowSel[k] || {}), c: cb.checked };
+    persistSel(); renderRows(lastModel);
   });
-  document.querySelectorAll('.view').forEach(v => v.classList.toggle('hidden', v.id !== 'view-' + name));
-  if (name === 'history') renderHistory();
-  if (name === 'mirrors' && st.job) render();
+  t.querySelectorAll('.domcb').forEach(cb => cb.onchange = () => {
+    const i = +cb.dataset.d;
+    if (!domSel) domSel = settings.domains.map((_, j) => j !== i);
+    else domSel[i] = cb.checked ? 1 : 0;
+    persistSel(); renderDomains(); renderRows(lastModel);
+  });
+  const cbAll = t.querySelector('#cbAll');
+  if (cbAll) cbAll.onchange = () => {
+    allKeys.forEach(k => rowSel[k] = { ...(rowSel[k] || {}), c: cbAll.checked });
+    persistSel(); renderRows(lastModel);
+  };
+  const lAll = t.querySelector('#lnkAll'), lNone = t.querySelector('#lnkNone');
+  if (lAll) lAll.onclick = e => { e.preventDefault(); allKeys.forEach(k => rowSel[k] = { ...(rowSel[k] || {}), c: true }); persistSel(); renderRows(lastModel); };
+  if (lNone) lNone.onclick = e => { e.preventDefault(); allKeys.forEach(k => rowSel[k] = { ...(rowSel[k] || {}), c: false }); persistSel(); renderRows(lastModel); };
+  t.querySelectorAll('.star:not(.retry):not(.del)').forEach(b => b.onclick = () => {
+    const k = b.dataset.k;
+    rowSel[k] = { ...(rowSel[k] || {}), f: !favGet(k) };
+    persistSel(); renderRows(lastModel);
+  });
+  t.querySelectorAll('[data-recheck]').forEach(b => b.onclick = () => reCheckSource(b.dataset.recheck));
+  t.querySelectorAll('.lnkOff').forEach(a => a.onclick = e => {
+    e.preventDefault();
+    const gid = a.dataset.g;
+    if (grpCol[gid]) { grpCol[gid] = false; persistSel(); renderRows(lastModel); return; }
+    hideUnchecked = false;
+    document.getElementById('chkHide').checked = false;
+    persistSel(); renderRows(lastModel);
+  });
+  const cbOk = t.querySelector('#cbHideOk');
+  if (cbOk) cbOk.onchange = () => {
+    hideOkGlobal = cbOk.checked;
+    persistSel(); renderRows(lastModel);
+  };
+  t.querySelectorAll('.grphideok').forEach(cb => cb.onchange = () => {
+    grpHideOk[cb.dataset.g] = cb.checked;
+    persistSel(); renderRows(lastModel);
+  });
+  t.querySelectorAll('.lnkOk').forEach(a => a.onclick = e => {
+    e.preventDefault();
+    if (hideOkGlobal) hideOkGlobal = false;
+    else grpHideOk[a.dataset.g] = false;
+    persistSel(); renderRows(lastModel);
+  });
+  t.querySelectorAll('[data-collapse]').forEach(b => b.onclick = () => {
+    grpCol[b.dataset.collapse] = !grpCol[b.dataset.collapse];
+    persistSel(); renderRows(lastModel);
+  });
+  t.querySelectorAll('[data-closedetail]').forEach(b => b.onclick = () => {
+    if (openDetailKey === b.dataset.closedetail) openDetailKey = null;
+    renderRows(lastModel);
+  });
+  t.querySelectorAll('[data-retry]').forEach(b => b.onclick = () => reCheckRow(b.dataset.retry));
+  t.querySelectorAll('.cellretry').forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    reCheckCell(b.dataset.k, +b.dataset.d);
+  });
+  t.querySelectorAll('[data-recheckfailed]').forEach(b => b.onclick = () => reCheckGroupFailed(b.dataset.recheckfailed));
+  t.querySelectorAll('[data-msgretry]').forEach(b => b.onclick = () => reCheckSource(b.dataset.msgretry));
+  t.querySelectorAll('[data-delrow]').forEach(b => b.onclick = () => {
+    const k = b.dataset.delrow;
+    for (const g of lastModel.groups) { const i = g.rows.findIndex(r => r.key === k); if (i > -1) { g.rows.splice(i, 1); break; } }
+    deletedRows.add(k);
+    if (openDetailKey === k) openDetailKey = null;
+    persistSel(); renderRows(lastModel);
+    log('нода удалена из списка: ' + k, 'warn');
+  });
+  t.querySelectorAll('.lnkDead').forEach(a => a.onclick = e => {
+    e.preventDefault();
+    grpDeadOpen[a.dataset.g] = !grpDeadOpen[a.dataset.g];
+    log(grpDeadOpen[a.dataset.g] ? `недоступные ноды развёрнуты` : `недоступные ноды свёрнуты`);
+    renderRows(lastModel);
+  });
+  t.querySelectorAll('.cell[data-k]').forEach(el => {
+    el.onclick = () => {
+      const k = el.dataset.k;
+      openDetailKey = (openDetailKey === k) ? null : k;   // повторный клик — закрыть
+      renderRows(lastModel);
+    };
+  });
 }
 
-/* ---------- export ---------- */
-
-function csvCell(v) {
-  let s = v == null ? '' : String(v);
-  if (/^[=+\-@]/.test(s)) s = "'" + s;   // keep spreadsheets from running formulas
-  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+/* детали выезжают строкой ПОД нодой: одна строка на домен, код цветом результата */
+function detailRowHtml(r, doms, nCols) {
+  const lines = doms.map((d, di) => {
+    const c = r.cells[di];
+    const dom = `<b>${esc(shortDomain(d))}</b>`;
+    if (!c) return `<div class="dline"><span class="cell empty">—</span> ${dom} · нет данных</div>`;
+    if (c.loading) return `<div class="dline"><span class="cell loading">…</span> ${dom} · проверяю…</div>`;
+    const cls = cellClass(c.code, c);
+    const ms = (c.ms != null && !isNaN(c.ms)) ? ` · ${(c.ms / 1000).toFixed(2)}s` : '';
+    const extras = [];
+    if (c.code) {
+      if (c.note) extras.push(c.note);
+      if (c.cfRay) extras.push('cf-ray ' + c.cfRay);
+      if (c.cfMitigated) extras.push('cf-mitigated: ' + c.cfMitigated);
+      if (c.ip) extras.push('ip ' + c.ip);
+      if (c.server) extras.push(c.server);
+    }
+    return `<div class="dline"><span class="cell ${cls}">${esc(cellText(c.code, null, c.note, c))}</span> ${dom}${ms} · ${esc(verdict(c.code, c))}` +
+      (extras.length ? ` · <span class="dextra">${esc(extras.join(' · '))}</span>` : '') + `</div>`;
+  }).join('');
+  return `<tr class="detail-row" data-k="${esc(r.key)}"><td colspan="${nCols}"><div class="dbox">${lines}` +
+    `<button class="btn mini" data-closedetail="${esc(r.key)}">▾ свернуть</button></div></td></tr>`;
 }
 
-function download(name, text, type) {
-  const url = URL.createObjectURL(new Blob([text], { type }));
+/* ---------------- история ---------------- */
+let histViewAt = null;   // просматриваемый снапшот (null = текущий)
+function histLoad() { let h = []; try { h = JSON.parse(localStorage.getItem(LS_HISTORY)) || []; } catch { } return h; }
+function histSave(h) {
+  h = h.slice(-30);
+  // снапшоты модели храним только у 6 последних — экономим localStorage
+  h.forEach((e, i) => { if (i < h.length - 6) delete e.model; });
+  try { localStorage.setItem(LS_HISTORY, JSON.stringify(h)); } catch { }
+}
+function pushHistory(summary, model) {
+  const h = histLoad();
+  h.push({
+    at: Date.now(), ok: summary.ok, warn: summary.warn, err: summary.err,
+    domains: model.domains.slice(),
+    model: model.groups.map(g => ({ ...g, rows: g.rows.map(r => ({ ...r })) })),
+  });
+  histSave(h);
+  renderHistory();
+}
+function renderHistory() {
+  const h = histLoad();
+  const el = document.getElementById('history');
+  if (!h.length && !lastAt) { el.innerHTML = ''; return; }
+  el.innerHTML = '<span>История прогонов (клик — просмотр, ✕ — удалить):</span>' + h.slice(-15).map(r =>
+    `<span class="hdot${histViewAt === r.at ? ' cur' : ''}" data-at="${r.at}"
+      style="background:${r.err > 0 ? 'var(--red)' : r.warn > 0 ? 'var(--orange)' : 'var(--green)'}"
+      title="${new Date(r.at).toLocaleString()} — ок:${r.ok} предупр.:${r.warn} ошибок:${r.err}${r.model ? '' : ' · снапшот не сохранён'}"></span>`
+  ).join('') + (lastAt ? `<span style="margin-left:10px">последний прогон: ${new Date(lastAt).toLocaleString()}</span>` +
+    `<button class="btn mini" id="btnRefreshResults" title="обновить результаты (полный прогон)">↻ обновить</button>` : '');
+  el.querySelectorAll('.hdot').forEach(d => d.onclick = () => viewRun(+d.dataset.at));
+  const rb = el.querySelector('#btnRefreshResults');
+  if (rb) rb.onclick = () => runAll();
+}
+function viewRun(at) {
+  const e = histLoad().find(x => x.at === at);
+  if (!e) return;
+  const banner = document.getElementById('histBanner');
+  if (histViewAt === at) { closeHistView(); return; }  // повторный клик — закрыть
+  if (!e.model) { log('снапшот этого прогона не сохранён (старше 6 последних)', 'warn'); return; }
+  histViewAt = at;
+  banner.classList.remove('hidden');
+  banner.innerHTML = `👁 Просмотр прогона от ${new Date(at).toLocaleString()} (ок:${e.ok} предупр.:${e.warn} ошибок:${e.err})` +
+    ` <button class="btn mini" id="btnHistBack">← вернуться к текущему</button>` +
+    ` <button class="btn mini" id="btnHistDel">✕ удалить этот прогон</button>`;
+  document.getElementById('btnHistBack').onclick = closeHistView;
+  document.getElementById('btnHistDel').onclick = () => deleteRun(at);
+  renderRows({ at, domains: e.domains, groups: e.model });
+  renderHistory();
+  log(`история: открыт снапшот прогона от ${new Date(at).toLocaleString()}`);
+}
+function closeHistView() {
+  histViewAt = null;
+  document.getElementById('histBanner').classList.add('hidden');
+  renderRows(lastModel);
+  renderHistory();
+}
+function deleteRun(at) {
+  histSave(histLoad().filter(x => x.at !== at));
+  log(`история: прогон от ${new Date(at).toLocaleString()} удалён`, 'warn');
+  if (histViewAt === at) closeHistView(); else renderHistory();
+}
+
+/* ---------------- выгрузка ---------------- */
+function downloadFile(name, text, mime) {
+  const b = new Blob([text], { type: mime });
+  const u = URL.createObjectURL(b);
   const a = document.createElement('a');
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  a.href = u; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(u), 5000);
 }
-
-function exportCsv() {
-  const job = st.job; if (!job) return;
-  const cols = ['url', 'source', 'exit_id', 'exit_label', 'country', 'exit_ip', 'status', 'code', 'ms', 'error_class', 'cf_ray', 'cf_mitigated', 'repeats', 'note'];
-  const lines = [cols.join(',')];
-  for (const c of job.results || []) {
-    const reps = (c.repeats || []).map(r => `${r.status}:${r.code ?? ''}`).join(' | ');
-    lines.push([c.url, c.source, c.exitId, c.exitLabel, c.country, c.exitIp, c.status, c.code, c.ms, c.errorClass, c.cfRay, c.cfMitigated, reps, c.note]
-      .map(csvCell).join(','));
+function stamp() { return new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19); }
+function exportCSV() {
+  if (!lastModel) return;
+  const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const head = ['source', 'node', 'provider', 'domain', 'code', 'ms', 'verdict',
+    'cf_ray', 'cf_mitigated', 'server', 'ip', 'error'].join(',');
+  const lines = [head];
+  for (const g of lastModel.groups) {
+    for (const r of g.rows) {
+      if (r.isMsg) continue;
+      lastModel.domains.forEach((d, di) => {
+        const c = r.cells[di] || {};
+        lines.push([q(g.title), q(r.title), q(r.sub || ''), q(d),
+          c.code || '', c.ms ?? '', q(verdict(c.code, c)),
+          q(c.cfRay || ''), q(c.cfMitigated || ''), q(c.server || ''),
+          q(c.ip || ''), q(c.error || c.note || '')].join(','));
+      });
+    }
   }
-  download(`geocheck-${job.id}.csv`, '﻿' + lines.join('\r\n') + '\r\n', 'text/csv;charset=utf-8');
+  downloadFile('geocheck-' + stamp() + '.csv', lines.join('\r\n'), 'text/csv;charset=utf-8');
+}
+function exportJSON() {
+  if (!lastModel) return;
+  downloadFile('geocheck-' + stamp() + '.json',
+    JSON.stringify({ at: new Date(lastAt || Date.now()).toISOString(), domains: lastModel.domains, groups: lastModel.groups }, null, 2),
+    'application/json');
 }
 
-function exportJson() {
-  const job = st.job; if (!job) return;
-  download(`geocheck-${job.id}.json`, JSON.stringify(job, null, 2), 'application/json');
-}
-
-/* ---------- prefs and boot ---------- */
-
-function savePrefs() {
-  const prefs = {
-    urls: $('urls').value,
-    sources: { localExits: $('srcLocal').checked, checkHost: $('srcCheckHost').checked, globalPing: $('srcGlobalPing').checked, browser: $('srcBrowser').checked },
-    domainFirst: $('domainFirst').checked,
-    repeats: $('repeats').value, maxNodes: $('maxNodes').value,
-    apiBase: $('apiBase').value,
+/* ---------------- сохранение/восстановление ---------------- */
+function saveLastRun(model) {
+  const clean = {
+    at: Date.now(), domains: model.domains,
+    groups: model.groups.map(g => ({
+      ...g,
+      rows: g.rows.map(r => ({
+        ...r,
+        cells: Object.fromEntries(Object.entries(r.cells).map(([k, c]) =>
+          [k, c.loading ? { code: 0, note: 'нет ответа' } : c])),
+      })),
+    })),
   };
-  try { localStorage.setItem(LS_PREFS, JSON.stringify(prefs)); } catch { /* storage full or disabled */ }
+  lastAt = clean.at;
+  try { localStorage.setItem(LS_LAST, JSON.stringify(clean)); } catch { }
+}
+function restoreLastRun() {
+  try {
+    const s = JSON.parse(localStorage.getItem(LS_LAST));
+    if (!s || !s.groups) return;
+    if (JSON.stringify(s.domains) !== JSON.stringify(settings.domains)) return;
+    const idByTitle = { 'Локально': 'local', 'check-host.net': 'ch', 'GlobalPing': 'gp' };
+    s.groups.forEach(g => { if (!g.id) g.id = idByTitle[g.title] || g.title; });
+    lastModel = s;
+    lastAt = s.at;
+    renderRows(lastModel);
+    document.getElementById('btnCsv').disabled = false;
+    document.getElementById('btnJson').disabled = false;
+  } catch { }
 }
 
-function loadPrefs() {
-  let p = {};
-  try { p = JSON.parse(localStorage.getItem(LS_PREFS)) || {}; } catch { /* ignore */ }
-  if (p.urls != null) $('urls').value = p.urls;
-  const s = p.sources || {};
-  if (s.localExits != null) $('srcLocal').checked = !!s.localExits;
-  if (s.checkHost != null) $('srcCheckHost').checked = !!s.checkHost;
-  if (s.globalPing != null) $('srcGlobalPing').checked = !!s.globalPing;
-  if (s.browser != null) $('srcBrowser').checked = !!s.browser;
-  if (p.domainFirst != null) $('domainFirst').checked = !!p.domainFirst;
-  if (p.repeats != null) $('repeats').value = p.repeats;
-  if (p.maxNodes != null) $('maxNodes').value = p.maxNodes;
-  if (p.apiBase != null) $('apiBase').value = p.apiBase;
+/* ---------------- API-хелперы ---------------- */
+function daemonBase() { return /^https?:$/.test(location.protocol) ? location.origin : `http://127.0.0.1:${settings.daemonPort}`; }
+function rgToken() { try { return sessionStorage.getItem('rg.token') || ''; } catch { return ''; } }
+async function dFetch(path, opts = {}, retried = false) {
+  const headers = { ...(opts.headers || {}) };
+  const t = rgToken();
+  if (t) headers['X-RG-Token'] = t;
+  const r = await fetch(daemonBase() + path, { ...opts, headers });
+  if (r.status === 401 && !PUBLIC && !retried) {
+    const v = prompt('Токен демона (пароль закрытой страницы):');
+    if (v) { try { sessionStorage.setItem('rg.token', v.trim()); } catch { } return dFetch(path, opts, true); }
+  }
+  return r;
 }
-
-function init() {
-  loadPrefs();
-  const saved = sessionStorage.getItem(SS_TOKEN);
-  if (saved) { $('token').value = saved; $('rememberToken').checked = true; }
-
-  $('btnConnect').addEventListener('click', connect);
-  $('token').addEventListener('keydown', e => { if (e.key === 'Enter') connect(); });
-  $('btnStart').addEventListener('click', startJob);
-  $('btnCancel').addEventListener('click', cancelJob);
-  $('btnCsv').addEventListener('click', exportCsv);
-  $('btnJson').addEventListener('click', exportJson);
-  document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
-  $('history').addEventListener('click', e => {
-    const b = e.target.closest('.hist-item');
-    if (b) loadJob(b.dataset.id);
+async function daemonPing() {
+  try {
+    const r = await dFetch('/status', { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+async function apiFetch(url, opts = {}, label = '') {
+  try {
+    const r = await fetch(url, opts);
+    if (!r.ok) throw new Error(label + ' HTTP ' + r.status);
+    return r.json();
+  } catch (e) {
+    const j = await daemonPing();
+    if (!j) throw e;
+    log(label + ': прямой доступ не удался (' + (e.message || e) + ') — иду через демон', 'warn');
+    const r2 = await dFetch('/fwd?url=' + encodeURIComponent(url),
+      { ...opts, headers: { ...(opts.headers || {}), 'X-Via-Daemon': '1' } });
+    if (!r2.ok) throw new Error(label + ' (через демон) HTTP ' + r2.status);
+    return r2.json();
+  }
+}
+async function chFetch(path) {
+  return apiFetch('https://check-host.net' + path, { headers: { 'Accept': 'application/json' } }, 'check-host');
+}
+function parseChAttempt(a) {
+  // формат 2026: [ok, time_s, status, http_code, ip] | {"Message": ...} | null
+  if (a == null) return { code: 0, note: 'нет ответа' };
+  if (!Array.isArray(a)) {
+    const m = a.Message || a.message || JSON.stringify(a);
+    return { code: 0, note: m, error: m };
+  }
+  const [ok, time, status, code, ip] = a;
+  const ms = time != null && !isNaN(time) ? time * 1000 : null;
+  if (ok === 1 && code) return { code: +code, ms, ip: ip || '' };
+  return { code: 0, note: status || 'ошибка', error: status || '', ms };
+}
+function pollCheckHost(id) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    let n = 0;
+    const tick = async () => {
+      try {
+        const res = await chFetch(`/check-result/${id}`);
+        const done = Object.values(res).every(v => v != null);
+        if (done) {
+          log(`check-host: ${id.slice(0, 8)} — ответ собран за ${((Date.now() - t0) / 1000).toFixed(0)} с`, 'ok');
+          return resolve(res);
+        }
+        if (++n % 4 === 1) log(`check-host: опрос ${id.slice(0, 8)}… ${((Date.now() - t0) / 1000).toFixed(0)} с`);
+        if (Date.now() - t0 > 60000) return resolve(res);
+        setTimeout(tick, 1500);
+      } catch (e) { reject(e); }
+    };
+    tick();
   });
-  ['urls', 'srcLocal', 'srcCheckHost', 'srcGlobalPing', 'srcBrowser', 'domainFirst', 'repeats', 'maxNodes', 'apiBase']
-    .forEach(id => $(id).addEventListener('change', savePrefs));
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  setButtons();
-  if (saved) connect(); else setConn('grey', 'нужен токен');
+async function gpStart(domain, locations) {
+  const u = new URL(domain);
+  const body = JSON.stringify({
+    type: 'http', target: u.hostname, limit: 24,
+    ...(locations ? { locations } : {}),
+    measurementOptions: { protocol: 'HTTPS', request: { method: 'GET', path: u.pathname || '/', headers: {} } },
+  });
+  // 429 у GlobalPing — обычное дело: ждём и повторяем, максимум 3 раза
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const j = await apiFetch('https://api.globalping.io/v1/measurements', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+      }, 'GlobalPing');
+      return j.id;
+    } catch (e) {
+      const is429 = /429/.test(e.message || '');
+      if (!is429 || attempt === 3) throw e;
+      const wait = 15000 * attempt;
+      log(`GlobalPing: 429 — пауза ${wait / 1000} с перед повтором (${attempt}/3)`, 'warn');
+      setAction(`GlobalPing: жду ${wait / 1000} с (rate limit)…`);
+      await sleep(wait);
+    }
+  }
+}
+async function gpPoll(id) {
+  const t0 = Date.now();
+  let n = 0;
+  while (Date.now() - t0 < 90000) {
+    const j = await apiFetch(`https://api.globalping.io/v1/measurements/${id}`, {}, 'GlobalPing');
+    if (j.status === 'finished') {
+      log(`GlobalPing: ${id.slice(0, 8)} завершено, ответов от проб: ${(j.results || []).length}`, 'ok');
+      return j.results || [];
+    }
+    if (++n % 4 === 1) log(`GlobalPing: ждём пробы ${id.slice(0, 8)}… ${((Date.now() - t0) / 1000).toFixed(0)} с`);
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  log(`GlobalPing: измерение ${id.slice(0, 8)} не завершилось за 90 с`, 'warn');
+  return [];
+}
+async function daemonRun(domains) {
+  try {
+    const r = await dFetch('/jobs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domains, browser: !!settings.useBrowser, domainFirst: !!settings.domainFirst }),
+    });
+    const j = await r.json();
+    if (!j.ok) return { error: j.error || ('HTTP ' + r.status) };
+    const t0 = Date.now();
+    let n = 0;
+    while (Date.now() - t0 < 1800000) {
+      await new Promise(res => setTimeout(res, 2500));
+      const sr = await dFetch('/jobs/' + j.id);
+      const sj = await sr.json();
+      const job = sj.job;
+      if (!job) return { error: sj.error || 'задание потеряно' };
+      if (++n % 4 === 0) setAction(`демон: ${job.progress.done}/${job.progress.total} замеров…`);
+      if (['done', 'error', 'cancelled'].includes(job.status)) return { results: job.results || {}, exits: job.exits, warnings: job.warnings };
+    }
+    return { error: 'задание не завершилось за 30 мин' };
+  } catch { return null; }
+}
+async function browserProbe(domain) {
+  try {
+    await fetch(domain, { mode: 'no-cors', signal: AbortSignal.timeout(60000), cache: 'no-store' });
+    return 'ok';
+  } catch { return 'fail'; }
 }
 
-init();
+/* ---------------- прогоны по источникам ---------------- */
+async function runLocal(model, seq, diList, rowFilter) {
+  const g = getGroup(model, 'local');
+  const want = k => !rowFilter || rowFilter.has(k);
+  spin.local = true; renderRows(model);
+  // браузерный пробник
+  const brow = getRow(model, 'local-browser');
+  if (brow && want(brow.key) && selGet(brow.key) && (rowFilter || !isRowOkHidden(model, brow))) {
+    for (const di of diList) {
+      const res = await browserProbe(model.domains[di]);
+      if (seq !== runSeq) return;
+      brow.cells[di] = { code: res === 'ok' ? 204 : 0, note: res === 'ok' ? 'доступен (opaque)' : 'обрыв' };
+      log(`браузер: ${shortDomain(model.domains[di])} — ${res === 'ok' ? 'доступен' : 'обрыв'}`, res === 'ok' ? 'ok' : 'err');
+      renderRows(model);
+    }
+  }
+  // демон
+  const dexits = daemonExits.filter(ex => {
+    const r = getRow(model, 'daemon:' + ex.id);
+    return r && want(r.key) && selGet(r.key) && (rowFilter || !isRowOkHidden(model, r));
+  });
+  if (dexits.length) {
+    const tDaemon = Date.now();
+    log(`демон: отправил ${diList.length} домен(ов) на прогон…`);
+    const dRes = await daemonRun(diList.map(di => model.domains[di]));
+    if (dRes && dRes.results) {
+      for (const ex of dexits) {
+        const r = getRow(model, 'daemon:' + ex.id);
+        diList.forEach(di => {
+          const c = dRes.results[ex.id] && dRes.results[ex.id][model.domains[di]];
+          r.cells[di] = c ? { ...c } : { code: 0, note: 'выход не вернул результат (соединение не поднялось)' };
+        });
+      }
+      log(`демон: ответ за ${((Date.now() - tDaemon) / 1000).toFixed(1)} с — ${dexits.length} строк`, 'ok');
+    } else {
+      log('демон: ' + (dRes && dRes.error ? dRes.error : 'нет ответа'), 'err');
+    }
+    renderRows(model);
+  }
+  spin.local = false; renderRows(model);
+}
+
+async function runCh(model, seq, diList, rowFilter) {
+  if (!settings.useCheckHost && !rowFilter) { return; }
+  spin.ch = true;
+  const g = getGroup(model, 'ch');
+  const pend = addMsg(model, 'ch', 'запрашиваю узлы check-host.net…');
+  renderRows(model);
+  try {
+    const doms = diList.map(di => model.domains[di]);
+    // те же узлы для всех доменов: первый запрос выбирает узлы, остальные получают их явно (node=)
+    // (иначе check-host берёт случайный набор на каждый запрос и сравнивать домены нечем)
+    const q = d => `/check-http?host=${encodeURIComponent(d)}`;
+    let nodeQs;
+    const starts = [];
+    if (rowFilter) {
+      const want = [...rowFilter].filter(k => k.startsWith('ch:')).map(k => k.slice(3));
+      if (!want.length) { dropMsg(model, pend); spin.ch = false; renderRows(model); return; }
+      nodeQs = want.map(n => '&node=' + encodeURIComponent(n)).join('');
+      starts.push(...await Promise.all(doms.map(d => chFetch(q(d) + nodeQs))));
+    } else {
+      const first = await chFetch(q(doms[0]) + `&max_nodes=${settings.maxNodes}`);
+      starts.push(first);
+      nodeQs = Object.keys(first.nodes || {}).map(n => '&node=' + encodeURIComponent(n)).join('');
+      starts.push(...await Promise.all(doms.slice(1).map(d => chFetch(q(d) + nodeQs))));
+    }
+    if (seq !== runSeq) return;
+    const nodeMeta = {};
+    for (const s of starts) {
+      for (const [name, info] of Object.entries(s.nodes || {})) {
+        if (Array.isArray(info)) {
+          nodeMeta[name] = {
+            location: info[2] && info[1] ? info[2] + ', ' + info[1] : (info[1] || name),
+            provider: info[4] || '',
+          };
+        }
+      }
+    }
+    doms.forEach((d, i) => log(`check-host: запрос ${shortDomain(d)} → ${starts[i].request_id || 'без id'}`));
+    dropMsg(model, pend);
+    const results = await Promise.all(starts.map(s => pollCheckHost(s.request_id)));
+    if (seq !== runSeq) return;
+    let skipped = 0;
+    results.forEach((nodes, ri) => {
+      const di = diList[ri];
+      for (const [node, attempts] of Object.entries(nodes || {})) {
+        const key = 'ch:' + node;
+        if (deletedRows.has(key)) { skipped++; continue; }
+        if (rowFilter && !rowFilter.has(key)) { skipped++; continue; }
+        let r = getRow(model, key);
+        if (!r) {
+          if (!selGet(key)) { skipped++; continue; }  // новый узел, но выключен чекбоксом
+          const meta = nodeMeta[node] || {};
+          r = addRow(model, 'ch', { key, title: meta.location || node, sub: meta.provider || '', cells: {} });
+          log(`➕ узел check-host: ${meta.location || node}${meta.provider ? ' · ' + meta.provider : ''}`);
+        }
+        if (!selGet(r.key)) continue;
+        if (!rowFilter && isRowOkHidden(model, r)) { skipped++; continue; }
+        const list = (attempts || []).filter(Boolean);
+        const a = list.find(x => Array.isArray(x) && x[0] === 1) || list[0] || null;
+        r.cells[di] = parseChAttempt(a);
+        renderRows(model);
+      }
+    });
+    if (skipped) log(`check-host: пропущено ${skipped} результатов (выключены чекбоксами)`);
+  } catch (e) {
+    console.warn('check-host:', e);
+    pend.title = '⚠ check-host.net недоступен: ' + (e.message || e);
+    pend.isPending = false;
+    pend.retry = 'ch';
+    log('check-host: ошибка — ' + (e.message || e), 'err');
+  }
+  spin.ch = false; renderRows(model);
+}
+
+async function runGp(model, seq, diList, rowFilter) {
+  if (!settings.useGlobalPing && !rowFilter) { return; }
+  spin.gp = true;
+  const pend = addMsg(model, 'gp', 'запрашиваю пробы GlobalPing…');
+  renderRows(model);
+  try {
+    const doms = diList.map(di => model.domains[di]);
+    // создаём измерения ПО ОДНОМУ с паузой — не бомбим API (429)
+    // ВАЖНО: все домены меряются ОДНИМИ И ТЕМИ ЖЕ пробами (locations = id первого измерения),
+    // иначе сравнение «.com vs .ru из одной точки» невозможно — GlobalPing иначе берёт случайные пробы
+    let locs = null;
+    if (rowFilter) {
+      locs = [...rowFilter].filter(k => k.startsWith('gp:')).map(k => {
+        const [country, city, network] = k.slice(3).split('|');
+        const l = { limit: 1 };
+        if (country) l.country = country;
+        if (city) l.city = city;
+        if (network) l.network = network;
+        return l;
+      });
+      if (!locs.length) { dropMsg(model, pend); spin.gp = false; renderRows(model); return; }
+    }
+    const ids = [];
+    for (const d of doms) {
+      ids.push(await gpStart(d, locs || (ids.length ? ids[0] : null)));
+      if (doms.length > 1) await sleep(2500);
+    }
+    log(`GlobalPing: измерения созданы: ${ids.map(x => x.slice(0, 8)).join(', ')}`);
+    const all = await Promise.all(ids.map(gpPoll));
+    if (seq !== runSeq) return;
+    dropMsg(model, pend);
+    all.forEach((results, ri) => {
+      const di = diList[ri];
+      for (const item of results) {
+        const p = item.probe || {};
+        const res = item.result || {};
+        const t = res.timings || {};
+        const hdr = res.headers || {};
+        const key = 'gp:' + [p.country, p.city, p.network].join('|');
+        if (deletedRows.has(key)) continue;
+        if (rowFilter && !rowFilter.has(key)) continue;
+        let r = getRow(model, key);
+        if (!r) {
+          if (!selGet(key)) continue;
+          r = addRow(model, 'gp', { key, title: [p.country, p.city].filter(Boolean).join(', '), sub: p.network || '', cells: {} });
+          log(`➕ проба GlobalPing: ${[p.country, p.city].filter(Boolean).join(', ')}`);
+        }
+        if (!selGet(r.key)) continue;
+        if (!rowFilter && isRowOkHidden(model, r)) continue;
+        r.cells[di] = res.statusCode
+          ? { code: res.statusCode, ms: t.total != null ? t.total : null, ip: res.resolvedAddress || '',
+              cfRay: hdr['cf-ray'] || '', cfMitigated: hdr['cf-mitigated'] || '', server: hdr['server'] || '' }
+          : { code: 0, note: res.statusCodeName || 'ошибка пробы',
+              error: res.rawError || res.statusCodeName || res.status || '' };
+        renderRows(model);
+      }
+    });
+  } catch (e) {
+    console.warn('globalping:', e);
+    pend.title = '⚠ GlobalPing недоступен: ' + (e.message || e);
+    pend.isPending = false;
+    pend.retry = 'gp';
+    log('GlobalPing: ошибка — ' + (e.message || e), 'err');
+  }
+  spin.gp = false; renderRows(model);
+}
+
+function tallyModel(model) {
+  const summary = { ok: 0, warn: 0, err: 0 };
+  for (const g of model.groups) for (const r of g.rows) {
+    if (r.isMsg) continue;
+    Object.values(r.cells).forEach(c => {
+      if (!c || c.loading) return;
+      const cls = cellClass(c.code, c);
+      if (cls === 'ok' || cls === 'redir') summary.ok++;
+      else if (cls === 'warn') summary.warn++;
+      else summary.err++;
+    });
+  }
+  return summary;
+}
+
+function releaseRunButton() {
+  const btn = document.getElementById('btnRun');
+  btn.disabled = false; btn.textContent = '▶ Запустить проверку';
+  document.title = 'GeoCheck';
+}
+
+function finalize(model, seq, tRun, full = false) {
+  // честные «нет данных»: точка участвовала в прогоне, а ячейка пуста/висит в loading —
+  // значит источник не довёз результат. Красный ERR с причиной вместо серого «—»
+  // («—» остаётся только у точек, выключенных чекбоксом, и у свёрнутых успешных)
+  const diList = activeDomainIdxs();
+  let filled = 0;
+  for (const g of model.groups) for (const r of g.rows) {
+    if (r.isMsg || !selGet(r.key) || isRowOkHidden(model, r)) continue;
+    for (const di of diList) {
+      const c = r.cells[di];
+      if (c && c.loading) { r.cells[di] = { code: 0, note: 'источник не довёл проверку до конца' }; filled++; }
+      else if (!c) { r.cells[di] = { code: 0, note: 'источник не вернул результат' }; filled++; }
+    }
+  }
+  if (filled) log(`⚠ ${filled} ячеек без результата — источники не довезли данные (красные ERR с пояснением; перепроверьте кнопкой ⟳)`, 'warn');
+  stopRunIndicator();
+  const summary = tallyModel(model);
+  log(`прогон ${seq} завершён за ${((Date.now() - tRun) / 1000).toFixed(1)} с — ок: ${summary.ok}, предупр.: ${summary.warn}, ошибок: ${summary.err}`, summary.err ? 'warn' : 'ok');
+  saveLastRun(model);
+  document.getElementById('btnCsv').disabled = false;
+  document.getElementById('btnJson').disabled = false;
+  if (full) pushHistory(summary, model);   // перепроверки точек/ячеек историю не засоряют
+  setAction(`прогон ${seq} завершён — ок: ${summary.ok}, предупр.: ${summary.warn}, ошибок: ${summary.err} · ${new Date().toLocaleTimeString('ru-RU')}`);
+  if (histViewAt) closeHistView(); else renderRows(model);
+}
+
+async function runAll() { paceRun('прогон', runAllNow); }
+async function runAllNow() {
+  if (!settings.domains.length) { alert('Добавьте хотя бы один домен.'); return; }
+  const seq = ++runSeq;
+  const tRun = Date.now();
+  const diList = activeDomainIdxs();
+  if (!diList.length) { alert('Отметьте хотя бы один домен.'); return; }
+  const btn = document.getElementById('btnRun');
+  btn.disabled = true; btn.textContent = '⏳ Проверяю…';
+  log(`прогон ${seq}: ${diList.length}/${settings.domains.length} домен(ов) · ${settings.useCheckHost ? 'check-host ' : ''}${settings.useGlobalPing ? 'GlobalPing' : ''} · демон: ${daemonExits.length ? daemonExits.length + ' выходов' : 'не подключён'}`);
+  setAction(`прогон ${seq} запущен — ${diList.length} домен(ов), идёт проверка…`);
+  startRunIndicator(`прогон ${seq}`);
+
+  // ноды СОХРАНЯЮТСЯ между прогонами: переиспользуем модель, если домены те же;
+  // новые ноды добавятся, старые останутся — не возвращаем только удалённые вручную
+  let model;
+  if (lastModel && JSON.stringify(lastModel.domains) === JSON.stringify(settings.domains)) {
+    model = lastModel;
+    for (const g of model.groups) g.rows = g.rows.filter(r => !r.isMsg);  // старые статусные строки — в мусор
+  } else {
+    model = freshModel();
+  }
+  lastModel = model;
+  document.getElementById('btnCsv').disabled = true;
+  document.getElementById('btnJson').disabled = true;
+  openDetailKey = null;
+
+  if (!getRow(model, 'local-browser'))
+    addRow(model, 'local', { key: 'local-browser', title: 'Этот браузер (ваш канал)', sub: 'no-cors пробник: ок/обрыв', cells: {} });
+  if (daemonExits.length) {
+    daemonExits.forEach(ex => {
+      const k = 'daemon:' + ex.id;
+      const r = getRow(model, k);
+      if (r) { r.title = ex.label; r.sub = ex.status || ''; }  // обновим статус, ячейки сохраним
+      else addRow(model, 'local', { key: k, title: ex.label, sub: ex.status || '', cells: {} });
+    });
+  } else {
+    addMsg(model, 'local', `сервер проверки не отвечает — VPN-выходы недоступны`);
+  }
+  markLoading(model, diList, null);
+  renderRows(model);
+
+  try {
+    await runLocal(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    await runCh(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    await runGp(model, seq, diList, null);
+    if (seq !== runSeq) return;
+    finalize(model, seq, tRun, true);
+  } finally {
+    releaseRunButton();   // даже если прогон прерван перепроверкой или упал
+    spin.local = spin.ch = spin.gp = false;
+  }
+}
+
+async function reCheckSource(id) {
+  if (!lastModel) { alert('Сначала запустите полную проверку — источнику нужны строки для обновления.'); return; }
+  const seq = ++runSeq;
+  const tRun = Date.now();
+  const diList = activeDomainIdxs();
+  if (!diList.length) { alert('Отметьте хотя бы один домен.'); return; }
+  const g = getGroup(lastModel, id);
+  if (!g) return;
+  const keys = new Set(g.rows.filter(r => !r.isMsg && selGet(r.key) && !isRowOkHidden(lastModel, r)).map(r => r.key));
+  if (!keys.size) { log(`перепроверка ${g.title}: нет выбранных точек`, 'warn'); return; }
+  log(`↻ перепроверка источника «${g.title}»: ${keys.size} точек × ${diList.length} домен(ов)`);
+  setAction(`перепроверяю «${g.title}»…`);
+  startRunIndicator(`перепроверка «${g.title}»`);
+  markLoading(lastModel, diList, keys);
+  renderRows(lastModel);
+  if (id === 'local') await runLocal(lastModel, seq, diList, keys);
+  else if (id === 'ch') await runCh(lastModel, seq, diList, keys);
+  else if (id === 'gp') await runGp(lastModel, seq, diList, keys);
+  if (seq !== runSeq) return;
+  finalize(lastModel, seq, tRun);
+}
+
+/* универсальный перезапуск набора точек */
+async function recheckKeys(keys, label) {
+  if (!lastModel || !keys.size) return;
+  const diList = activeDomainIdxs();
+  if (!diList.length) { alert('Отметьте хотя бы один домен.'); return; }
+  const seq = ++runSeq;
+  const tRun = Date.now();
+  const rf = new Set(keys);
+  log(`↻ ${label}: ${keys.size} точек × ${diList.length} домен(ов)`);
+  setAction(`${label}…`);
+  startRunIndicator(label);
+  markLoading(lastModel, diList, rf);
+  renderRows(lastModel);
+  await runLocal(lastModel, seq, diList, rf);
+  if (seq !== runSeq) return;
+  await runCh(lastModel, seq, diList, rf);
+  if (seq !== runSeq) return;
+  await runGp(lastModel, seq, diList, rf);
+  if (seq !== runSeq) return;
+  finalize(lastModel, seq, tRun);
+}
+
+function failedKeys(rows, diList) {
+  const keys = new Set();
+  for (const r of rows) {
+    if (r.isMsg) continue;
+    if (isRowOkHidden(lastModel, r)) continue;   // свёрнутые успешные не перепроверяем
+    if (diList.some(di => r.cells[di] && isFailed(r.cells[di]))) keys.add(r.key);
+  }
+  return keys;
+}
+
+async function recheckFailed() {
+  if (!lastModel) { alert('Сначала запустите полную проверку.'); return; }
+  const rows = lastModel.groups.flatMap(g => g.rows);
+  const keys = failedKeys(rows, activeDomainIdxs());
+  if (!keys.size) { log('↻ упавшие: всё зелёное, перепроверять нечего', 'ok'); return; }
+  await recheckKeys(keys, 'перезапуск упавших');
+}
+
+/* упавшие только внутри одной группы */
+async function reCheckGroupFailed(gid) {
+  if (!lastModel) return;
+  const g = getGroup(lastModel, gid);
+  if (!g) return;
+  const keys = failedKeys(g.rows, activeDomainIdxs());
+  if (!keys.size) { log(`↻ «${g.title}»: упавших нет`, 'ok'); return; }
+  await recheckKeys(keys, `упавшие «${g.title}»`);
+}
+
+/* одна точка */
+async function reCheckRow(key) {
+  if (!lastModel) return;
+  const r = getRow(lastModel, key);
+  if (!r || r.isMsg) return;
+  await recheckKeys(new Set([key]), `точка «${r.title}»`);
+}
+
+/* одна ячейка (точка × домен) */
+async function reCheckCell(key, di) {
+  if (!lastModel) return;
+  const r = getRow(lastModel, key);
+  if (!r || r.isMsg) return;
+  if (!selGet(key)) { alert('Точка выключена чекбоксом — включите её, чтобы перепроверить ячейку.'); return; }
+  const seq = ++runSeq;
+  const tRun = Date.now();
+  r.cells[di] = { loading: true };
+  renderRows(lastModel);
+  log(`⟳ ячейка: «${r.title}» × ${shortDomain(lastModel.domains[di])}`);
+  setAction(`перепроверяю одну ячейку…`);
+  startRunIndicator('перепроверка ячейки');
+  const rf = new Set([key]);
+  if (key.startsWith('ch:')) await runCh(lastModel, seq, [di], rf);
+  else if (key.startsWith('gp:')) await runGp(lastModel, seq, [di], rf);
+  else await runLocal(lastModel, seq, [di], rf);   // local-browser + daemon:*
+  if (seq !== runSeq) return;
+  finalize(lastModel, seq, tRun);
+}
+
+/* ---------------- прогрев VPN (пинг всех выходов) ---------------- */
+async function warmupLocal() {
+  const j = await daemonPing();
+  if (!j || !j.ok) { log('прогрев: демон не отвечает', 'err'); setAction('прогрев невозможен — демон не отвечает'); return; }
+  const btn = document.getElementById('btnWarmup');
+  btn.disabled = true; btn.textContent = '♨ Прогреваю…';
+  setAction('прогрев VPN: пингую каждый выход…');
+  log(`прогрев: пингую ${(j.exits || []).length} выход(ов) через trace cloudflare…`);
+  const t0 = Date.now();
+  try {
+    const r = await dFetch('/warmup', { signal: AbortSignal.timeout(300000) });
+    const w = await r.json();
+    if (!w.ok) throw new Error(w.error || 'демон вернул ошибку');
+    let alive = 0, dead = 0;
+    for (const [id, res] of Object.entries(w.results || {})) {
+      const ex = daemonExits.find(e => e.id === id);
+      if (!ex) continue;
+      if (res.code >= 200 && res.code < 400) {
+        alive++;
+        ex.status = `OK ${res.ms}мс · exit ${res.ip || '?'} (${res.loc || '??'})`;
+      } else {
+        dead++;
+        ex.status = `⚠ мёртв — ${res.error || 'нет ответа'}`;
+      }
+    }
+    // подтянем exit-IP из демона и обновим sub строк в текущей модели
+    await refreshDaemonState();
+    if (lastModel) {
+      for (const ex of daemonExits) {
+        const row = getRow(lastModel, 'daemon:' + ex.id);
+        if (row) row.sub = ex.status || '';
+      }
+      renderRows(lastModel);
+    }
+    log(`прогрев завершён за ${((Date.now() - t0) / 1000).toFixed(1)} с — живых выходов: ${alive}, мёртвых: ${dead}`, dead ? 'warn' : 'ok');
+    setAction(`прогрев: живых выходов ${alive} / мёртвых ${dead} · ${new Date().toLocaleTimeString('ru-RU')}`);
+  } catch (e) {
+    log('прогрев: ошибка — ' + (e.message || e), 'err');
+    setAction('прогрев завершился с ошибкой');
+  }
+  btn.disabled = false; btn.textContent = '♨ Прогрев VPN';
+}
+
+/* ---------------- демон: статус ---------------- */
+async function refreshDaemonState(badge) {
+  const j = await daemonPing();
+  const dot = document.getElementById('daemonDot');
+  if (j && j.ok) {
+    dot.className = 'dot dot-green';
+    dot.title = 'Сервер проверки — активен';
+    daemonExits = j.exits || [];
+    if (badge) { badge.textContent = 'демон активен · выходов: ' + daemonExits.length; badge.style.color = 'var(--green)'; }
+  } else {
+    dot.className = 'dot dot-grey';
+    dot.title = 'Сервер проверки не отвечает';
+    daemonExits = [];
+    if (badge) { badge.textContent = 'демон не отвечает'; badge.style.color = ''; }
+  }
+  return !!j;
+}
+
+/* ---------------- настройки ---------------- */
+function openSettings() {
+  document.getElementById('setDomains').value = settings.domains.join('\n');
+  document.getElementById('setUseCheckHost').checked = settings.useCheckHost;
+  document.getElementById('setUseGlobalPing').checked = settings.useGlobalPing;
+  document.getElementById('setUseBrowser').checked = !!settings.useBrowser;
+  document.getElementById('setDomainFirst').checked = !!settings.domainFirst;
+  document.getElementById('setMaxNodes').value = settings.maxNodes;
+  document.getElementById('setDaemonPort').value = settings.daemonPort;
+  document.getElementById('setExitLabels').value = (settings.exitLabels || []).join(', ');
+  document.getElementById('setSubs').value = '';
+  document.getElementById('settingsMsg').textContent = '';
+  document.getElementById('subsMsg').textContent = '';
+  document.getElementById('modal').classList.remove('hidden');
+}
+function closeSettings() { document.getElementById('modal').classList.add('hidden'); }
+
+/* ---------------- инициализация ---------------- */
+document.getElementById('btnClearLog').onclick = () => { document.getElementById('log').innerHTML = ''; };
+document.getElementById('btnToggleLog').onclick = () => {
+  const w = document.getElementById('logWrap');
+  w.classList.toggle('collapsed');
+  document.getElementById('btnToggleLog').textContent = w.classList.contains('collapsed') ? '▸ развернуть' : '▾ свернуть';
+};
+document.getElementById('btnLogFull').onclick = () => {
+  const w = document.getElementById('logWrap');
+  w.classList.remove('collapsed');
+  document.getElementById('btnToggleLog').textContent = '▾ свернуть';
+  w.classList.toggle('max');
+  document.getElementById('btnLogFull').textContent = w.classList.contains('max') ? '✕' : '⛶';
+};
+document.getElementById('btnLogWin').onclick = () => {
+  const txt = document.getElementById('log').innerText || '(журнал пуст)';
+  const w = window.open('', 'geocheck-log', 'width=900,height=600');
+  if (!w) { log('не удалось открыть окно — разрешите всплывающие окна', 'warn'); return; }
+  w.document.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>GeoCheck — журнал (снимок)</title>' +
+    '<style>body{background:#0d1117;color:#e6edf3;font:12px/1.6 Consolas,monospace;padding:12px;white-space:pre-wrap}' +
+    '.t{color:#6e7681}</style></head><body>' +
+    txt.replace(/&/g, '&amp;').replace(/</g, '&lt;') +
+    '\n\n--- снимок на момент открытия; живой журнал — в основном окне ---</body></html>');
+  w.document.close();
+};
+document.getElementById('chkLogBad').onchange = e => {
+  document.getElementById('logWrap').classList.toggle('only-bad', e.target.checked);
+};
+document.getElementById('btnRun').onclick = runAll;
+document.getElementById('btnCsv').onclick = exportCSV;
+document.getElementById('btnJson').onclick = exportJSON;
+document.getElementById('btnRecheckFailed').onclick = recheckFailed;
+document.getElementById('btnWarmup').onclick = warmupLocal;
+document.getElementById('chkHide').checked = hideUnchecked;
+document.getElementById('chkHide').onchange = e => {
+  hideUnchecked = e.target.checked;
+  persistSel(); renderRows(lastModel);
+};
+document.getElementById('btnSettings').onclick = openSettings;
+document.getElementById('btnCancel').onclick = closeSettings;
+document.getElementById('btnSave').onclick = () => {
+  const doms = document.getElementById('setDomains').value.split('\n').map(s => s.trim()).filter(Boolean).map(normUrl);
+  settings.domains = doms.length ? doms : settings.domains;
+  domSel = null;
+  settings.useCheckHost = document.getElementById('setUseCheckHost').checked;
+  settings.useGlobalPing = document.getElementById('setUseGlobalPing').checked;
+  settings.useBrowser = document.getElementById('setUseBrowser').checked;
+  settings.domainFirst = document.getElementById('setDomainFirst').checked;
+  settings.maxNodes = Math.min(40, Math.max(5, +document.getElementById('setMaxNodes').value || 30));
+  settings.daemonPort = Math.min(65535, Math.max(1024, +document.getElementById('setDaemonPort').value || 8787));
+  settings.exitLabels = document.getElementById('setExitLabels').value.split(',').map(s => s.trim()).filter(Boolean);
+  saveSettings(); persistSel(); renderDomains(); renderRows(null); closeSettings();
+  refreshDaemonState();
+};
+document.getElementById('btnReset').onclick = () => {
+  if (!confirm('Сбросить все настройки (кроме истории и выбора)?')) return;
+  settings = { ...DEFAULTS }; domSel = null; saveSettings(); closeSettings();
+  renderDomains(); renderRows(null); refreshDaemonState();
+};
+document.getElementById('btnDaemonPing').onclick = async () => {
+  settings.daemonPort = Math.min(65535, Math.max(1024, +document.getElementById('setDaemonPort').value || 8787));
+  const badge = document.getElementById('daemonState');
+  badge.textContent = 'проверяю…'; badge.style.color = '';
+  await refreshDaemonState(badge);
+};
+document.getElementById('btnSendSubs').onclick = async () => {
+  const raw = document.getElementById('setSubs').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const msg = document.getElementById('subsMsg');
+  if (!raw.length) { msg.textContent = 'пусто — вставьте URL подписки или ссылки vless://…'; return; }
+  msg.textContent = 'отправляю на 127.0.0.1…';
+  try {
+    const r = await dFetch('/set_subscriptions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        urls: raw.filter(s => /^https?:\/\//i.test(s)),
+        inline: [raw.filter(s => !/^https?:\/\//i.test(s)).join('\n')].filter(Boolean),
+      }), signal: AbortSignal.timeout(120000),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      msg.textContent = 'принято демоном · выходов: ' + (j.exits || []).length + (j.warnings ? ' · ⚠ ' + j.warnings.join('; ') : '');
+      document.getElementById('setSubs').value = '';
+      await refreshDaemonState(document.getElementById('daemonState'));
+    } else { msg.textContent = 'демон: ' + (j.error || 'ошибка'); }
+  } catch { msg.textContent = 'демон не отвечает на 127.0.0.1:' + settings.daemonPort; }
+};
+
+(async function boot() {
+  try {
+    const h = await fetch(daemonBase() + '/api/health', { signal: AbortSignal.timeout(5000) });
+    const j = await h.json();
+    PUBLIC = !!(j && j.public);
+  } catch { }
+  document.body.classList.toggle('public', PUBLIC);
+  renderDomains();
+  renderRows(null);
+  renderHistory();
+  restoreLastRun();
+  refreshDaemonState();
+  log('Готово. Отметьте домены и точки, нажмите «Запустить проверку».');
 })();

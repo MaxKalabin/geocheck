@@ -19,6 +19,9 @@ Environment=XDG_CACHE_HOME=__HOME__/geocheck/cache
 Environment=PLAYWRIGHT_BROWSERS_PATH=__HOME__/geocheck/cache/ms-playwright
 Environment=SINGBOX_PATH=__HOME__/geocheck/bin/sing-box
 Environment=RG_CHROMIUM_PATH=/usr/bin/chromium
+Environment=GC_BROWSER_EXECUTABLE=/usr/bin/chromium
+Environment=GC_NO_SANDBOX=1
+Environment=GC_LOW_MEM=1
 ExecStart=__HOME__/geocheck/venv/bin/python daemon/checkdaemon.py
 Restart=on-failure
 RestartSec=5

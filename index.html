@@ -11,91 +11,106 @@
 <header>
   <div class="hd-left">
     <h1>GeoCheck</h1>
-    <span class="sub">доступность сайтов и страниц из разных стран · CloudFlare-aware</span>
+    <span class="sub">доступность сайта из разных стран</span>
   </div>
   <div class="hd-right">
-    <span id="daemonState" class="conn conn-grey" title="состояние демона">демон: не проверен</span>
-    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="токен демона" aria-label="токен демона">
-    <label class="ctl" title="токен останется только на этой вкладке (sessionStorage), не в файлах и не в URL">
-      <input type="checkbox" id="rememberToken"> запомнить на вкладке</label>
-    <button id="btnConnect" class="btn">Подключить</button>
+    <span id="daemonDot" class="dot dot-grey" title="Локальный демон"></span>
+    <button id="btnCsv" class="btn" disabled title="выгрузить последний прогон">⬇ CSV</button>
+    <button id="btnJson" class="btn" disabled title="выгрузить сырые данные прогона">⬇ JSON</button>
+    <button id="btnSettings" class="btn btn-ghost priv">⚙ Настройки</button>
+    <button id="btnRun" class="btn btn-primary">▶ Запустить проверку</button>
   </div>
 </header>
 
-<main>
-  <section class="panel" aria-labelledby="newCheckTitle">
-    <h2 id="newCheckTitle">Новая проверка</h2>
-    <div class="form-grid">
-      <div class="field">
-        <label for="urls">Адреса: домены или страницы, по одному в строке</label>
-        <textarea id="urls" rows="4" spellcheck="false"
-          placeholder="https://example.com/&#10;https://ru.example.com/&#10;https://example.ru/pricing"></textarea>
-        <div class="hint">Страница с путём проверяется как есть. Зеркала (.com / ru. / .ru) лучше вводить вместе — они попадут в сравнение.</div>
+<div class="legend">
+  <span><span class="sw" style="background:var(--green)"></span>2xx — ок</span>
+  <span><span class="sw" style="background:var(--blue)"></span>3xx — редирект</span>
+  <span><span class="sw" style="background:var(--orange)"></span>4xx — отказ (403 у CF = челлендж/блок)</span>
+  <span><span class="sw" style="background:var(--red)"></span>5xx — ошибка сервера/ориджина</span>
+  <span><span class="sw" style="background:var(--grey)"></span>обрыв / таймаут</span>
+</div>
+
+<div id="domainsBar" class="domains-bar"></div>
+
+<div class="ctl-bar">
+  <button id="btnRecheckFailed" class="btn">↻ Перезапустить упавшие</button>
+  <button id="btnWarmup" class="btn priv" title="проверить каждый VPN-выход: доступность, реальная страна и IP выхода">♨ Прогрев и перепроверка VPN</button>
+  <label class="ctl"><input type="checkbox" id="chkHide"> свернуть невыбранные</label>
+  <span class="ctl-hint">чекбоксы в шапке и у точек ограничивают прогон · ★ — избранное вверху · ↻ у источника — перепроверка только его</span>
+</div>
+
+<div id="histBanner" class="hidden"></div>
+<div id="matrixWrap"><table id="matrix"></table></div>
+<div id="history"></div>
+
+<section id="logWrap" class="log-wrap">
+  <div class="log-head">
+    <span>Журнал выполнения</span>
+    <span class="log-actions">
+      <label class="log-filter" title="показывать только ошибки и предупреждения"><input type="checkbox" id="chkLogBad"> только плохие</label>
+      <button id="btnLogWin" class="btn btn-ghost" title="открыть журнал в отдельном окне (снимок на момент открытия)">⧉ в окне</button>
+      <button id="btnLogFull" class="btn btn-ghost" title="журнал на весь экран">⛶</button>
+      <button id="btnClearLog" class="btn btn-ghost">очистить</button>
+      <button id="btnToggleLog" class="btn btn-ghost">▾ свернуть</button>
+    </span>
+  </div>
+  <div id="lastAction" class="last-action">готов к работе</div>
+  <div id="log" class="log-body"></div>
+</section>
+
+<footer>Внешние проверки идут из браузера в <b>check-host.net</b> и <b>GlobalPing</b>; VPN-выходы и браузерная проверка — на сервере.</footer>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h2>Настройки</h2>
+
+    <div class="field">
+      <label>Домены для проверки (по одному в строке)</label>
+      <textarea id="setDomains" spellcheck="false"></textarea>
+      <div class="hint">Пример: https://restaurantguru.com/ · https://ru.restaurantguru.com/ · https://restaurantguru.ru/</div>
+    </div>
+
+    <div class="checkline">
+      <label><input type="checkbox" id="setUseCheckHost"> check-host.net (~30 узлов: ping/http/tcp/dns)</label>
+      <label><input type="checkbox" id="setUseGlobalPing"> GlobalPing (сотни проб по миру)</label>
+      <label title="настоящий Chrome через каждый выход; антибот-заглушки помечаются отдельно и не считаются ошибкой; медленнее"><input type="checkbox" id="setUseBrowser"> браузерная проверка выходов (реальный статус, тайм-ауты, время загрузки)</label>
+      <label title="сначала открыть корень домена; если он не грузится — страницу не проверять"><input type="checkbox" id="setDomainFirst"> сначала проверять домен, потом страницу</label>
+      <label>узлов: <input type="number" id="setMaxNodes" min="5" max="40" style="width:60px"></label>
+    </div>
+
+    <div class="checkline">
+      <label>Локальный демон: порт</label>
+      <input type="number" id="setDaemonPort" min="1024" max="65535" style="width:90px">
+      <button id="btnDaemonPing" class="btn">Проверить связь</button>
+      <span id="daemonState" class="badge">не проверялся</span>
+    </div>
+    <div class="field">
+      <label>Метки локальных выходов (через запятую — для колонок «Этот ПК» и демона)</label>
+      <input type="text" id="setExitLabels">
+      <div class="hint">Например: «Этот ПК (VPN Throne), DE-1, NL-1, TR-1» — демон подставит метки по порядку.</div>
+    </div>
+
+    <div class="field">
+      <label>Подписки VPN — <span class="badge secure">не сохраняется · только 127.0.0.1</span></label>
+      <textarea id="setSubs" spellcheck="false" placeholder="https://...subs-link-1&#10;https://...subs-link-2"></textarea>
+      <div class="hint">
+        Отправляется только локальному демону (127.0.0.1:порт). При закрытии страницы забывается.
+        Альтернатива без ввода в браузер: переменная окружения <code>RG_SUBS</code> при старте демона.
       </div>
-      <div class="field">
-        <span class="label">Источники</span>
-        <label class="ctl"><input type="checkbox" id="srcLocal" checked> выходы демона (VPN-ядра, без браузера)</label>
-        <label class="ctl"><input type="checkbox" id="srcCheckHost" checked> check-host.net</label>
-        <label class="ctl"><input type="checkbox" id="srcGlobalPing" checked> GlobalPing</label>
-        <label class="ctl"><input type="checkbox" id="srcBrowser"> браузерная проверка выходов (медленнее)</label>
-        <label class="ctl"><input type="checkbox" id="domainFirst"> сначала корень домена, страницу — только если он открылся</label>
-        <div class="inline-fields">
-          <label>повторов <input type="number" id="repeats" min="1" max="3" value="3"></label>
-          <label>узлов max <input type="number" id="maxNodes" min="5" max="40" value="20"></label>
-        </div>
-      </div>
     </div>
-    <details class="advanced">
-      <summary>адрес демона (нужен, только если страница открыта не с демона)</summary>
-      <input id="apiBase" type="text" spellcheck="false" placeholder="пусто = тот же адрес, что у страницы, например http://100.73.113.77:8787">
-    </details>
-    <div class="actions">
-      <button id="btnStart" class="btn btn-primary" disabled>▶ Запустить</button>
-      <button id="btnCancel" class="btn" disabled>■ Отменить</button>
-      <span id="notice" class="notice" role="status" aria-live="polite"></span>
+    <div class="checkline">
+      <button id="btnSendSubs" class="btn">Отправить подписки на демон</button>
+      <span id="subsMsg"></span>
     </div>
-    <div class="progress" aria-hidden="true"><div id="progBar"></div></div>
-    <div id="progText" class="prog-text">нет запущенной проверки</div>
-  </section>
 
-  <nav class="tabs" role="tablist" aria-label="разделы">
-    <button class="tab active" role="tab" data-view="results" aria-selected="true">Результаты</button>
-    <button class="tab" role="tab" data-view="mirrors" aria-selected="false">Сравнение зеркал</button>
-    <button class="tab" role="tab" data-view="history" aria-selected="false">История</button>
-    <span class="spacer"></span>
-    <button id="btnCsv" class="btn btn-ghost" disabled>⬇ CSV</button>
-    <button id="btnJson" class="btn btn-ghost" disabled>⬇ JSON</button>
-  </nav>
-
-  <section id="view-results" class="view">
-    <aside id="deadExits" class="dead-exits hidden" aria-label="выходы не работают"></aside>
-    <div id="verdicts" class="verdicts" aria-label="вердикт по адресам"></div>
-    <div class="table-wrap">
-      <table id="matrix" aria-label="результаты по выходам и адресам"></table>
+    <div id="settingsMsg"></div>
+    <div class="modal-actions">
+      <button id="btnReset" class="btn btn-ghost">Сбросить</button>
+      <button id="btnCancel" class="btn">Отмена</button>
+      <button id="btnSave" class="btn btn-primary">Сохранить</button>
     </div>
-    <div class="legend">
-      <span><i class="sw st-ok"></i>ок</span>
-      <span><i class="sw st-warn"></i>медленно</span>
-      <span><i class="sw st-block"></i>блок / челлендж / 4xx / nginx 503</span>
-      <span><i class="sw st-err"></i>5xx / антибот не прошёл</span>
-      <span><i class="sw st-grey"></i>обрыв / домен не грузится</span>
-      <span><i class="sw st-dead"></i>выход не работает (вне вердикта)</span>
-    </div>
-  </section>
-
-  <section id="view-mirrors" class="view hidden" aria-label="сравнение зеркал">
-    <div id="mirrors"></div>
-  </section>
-
-  <section id="view-history" class="view hidden" aria-label="история проверок">
-    <div id="history" class="history"></div>
-  </section>
-</main>
-
-<footer>
-  Проверки выполняет локальный демон; браузер только показывает результаты. Внешние сервисы (check-host.net, GlobalPing)
-  демон запрашивает сам, токены внешних сервисов остаются на демоне. Формат API: <code>docs/API.md</code>.
-</footer>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>
