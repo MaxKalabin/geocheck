@@ -75,7 +75,7 @@ PUB_LIMIT_IP = (6, 600)          # не больше 6 проверок за 10 
 PUB_LIMIT_ALL = (60, 3600)       # и 60 в час на всех
 PUB_MAX_PENDING = 3
 FAKE_IP_NET = ipaddress.ip_network('198.18.0.0/15')
-STATIC_FILES = ('index.html', 'app.js', 'styles.css')
+STATIC_FILES = ('index.html', 'app.js', 'styles.css', 'compare.html', 'compare.js')
 LOOPBACK = ('127.0.0.1', 'localhost', '::1')
 # какие страницы вправе дёргать демон (CORS/Origin). Свои: RG_ORIGINS=https://geocheck.example.com,...
 ALLOWED_ORIGINS = {'http://127.0.0.1:7100', 'http://localhost:7100'}
@@ -753,6 +753,8 @@ class H(BaseHTTPRequestHandler):
             if not job:
                 return self._json({'ok': False, 'error': 'нет такого задания'}, 404)
             return self._json({'ok': True, 'job': job.snapshot(full=True)})
+        if path == '/stats':
+            return self._json({'ok': True, **HISTORY.stats(_days(self.path))})
         if path == '/history':
             return self._json({'ok': True, 'runs': HISTORY.list_runs()})
         if path.startswith('/history/'):
@@ -883,6 +885,16 @@ def pub_view(job):
 
 
 PUB_EXIT_LABEL = 'Сервер проверки'
+PUB_DEFAULT_TARGETS = ('https://ru.restaurantguru.com/', 'https://restaurantguru.ru/', 'https://restaurantguru.com/')
+
+
+def _days(path):
+    from urllib.parse import urlparse, parse_qs
+    try:
+        d = int(parse_qs(urlparse(path).query).get('days', [''])[0])
+        return d if 0 < d <= 3650 else None
+    except ValueError:
+        return None
 
 
 def pub_exit():
@@ -998,6 +1010,16 @@ class P(BaseHTTPRequestHandler):
             return self._send({'ok': True, 'version': VERSION, 'public': True})
         if path == '/status':
             return self._send({'ok': True, 'version': VERSION, 'public': True, 'exits': pub_exits_legacy()})
+        if path == '/stats':
+            dflt = [d.rstrip('/') for d in PUB_DEFAULT_TARGETS]
+            st = HISTORY.stats(_days(self.path), only_target=lambda t, p: not p.get('public') or t.rstrip('/') in dflt)
+            for e in st['exits']:
+                if e['label'].startswith('Этот ПК'):
+                    e['label'] = PUB_EXIT_LABEL
+            for c in st['matrix']:
+                if c['exit'].startswith('Этот ПК'):
+                    c['exit'] = PUB_EXIT_LABEL
+            return self._send({'ok': True, **st})
         if path.startswith('/fwd'):
             if not _fwd_ok(self._client()):
                 return self._send({'ok': False, 'error': 'слишком много запросов'}, 429)

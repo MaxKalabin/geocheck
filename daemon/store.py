@@ -90,6 +90,60 @@ class History:
         out['exitLabels'] = {c['exit_id']: c['exit_label'] for c in cells}
         return out
 
+    def stats(self, days=None, only_target=None):
+        """Сводка по всей истории: по выходам, по ресурсам и матрица ресурс × выход.
+
+        Доступность = ok / (ok + fail); exit_down и skipped не считаются (это не вина ресурса).
+        only_target(target, params) -> bool отфильтровывает ячейки (для публичной выдачи)."""
+        since = time.time() - days * 86400 if days else 0
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT r.id, r.created, r.params, c.exit_id, c.exit_label, c.target, c.status, c.result '
+                'FROM cells c JOIN runs r ON r.id = c.run_id WHERE r.created >= ? ORDER BY r.created', (since,)).fetchall()
+            runs_total = self._db.execute('SELECT COUNT(*) FROM runs WHERE created >= ?', (since,)).fetchone()[0]
+        ex, tg, mx = {}, {}, {}
+        last_run, last_targets = 0, set()
+
+        def acc(d, key):
+            return d.setdefault(key, {'ok': 0, 'fail': 0, 'down': 0, 'ms': 0, 'msn': 0, 'last': 0})
+        for r in rows:
+            params = json.loads(r['params'] or '{}')
+            if only_target and not only_target(r['target'], params):
+                continue
+            res = json.loads(r['result'])
+            st = r['status']
+            if st == 'geo_mismatch':
+                st = res.get('rawStatus') or 'fail'
+            label = r['exit_label'] or r['exit_id']
+            for d, key in ((ex, label), (tg, r['target']), (mx, (r['target'], label))):
+                a = acc(d, key)
+                a['last'] = max(a['last'], r['created'])
+                if st == 'ok':
+                    a['ok'] += 1
+                    if res.get('ms'):
+                        a['ms'] += res['ms']
+                        a['msn'] += 1
+                elif st == 'fail':
+                    a['fail'] += 1
+                elif st in ('exit_down', 'excluded'):
+                    a['down'] += 1
+            if r['created'] > last_run:
+                last_run, last_targets = r['created'], set()
+            if r['created'] == last_run:
+                last_targets.add(r['target'])
+
+        def fin(a):
+            n = a['ok'] + a['fail']
+            return {'ok': a['ok'], 'fail': a['fail'], 'down': a['down'], 'checks': n,
+                    'availability': round(100 * a['ok'] / n, 1) if n else None,
+                    'avgMs': round(a['ms'] / a['msn']) if a['msn'] else None, 'last': a['last']}
+        return {'runs': runs_total, 'days': days,
+                'exits': sorted(({'label': k, **fin(v)} for k, v in ex.items()),
+                                key=lambda x: (x['availability'] is None, -(x['availability'] or 0), x['avgMs'] or 1e9)),
+                'targets': sorted(({'target': k, 'active': k in last_targets, **fin(v)} for k, v in tg.items()),
+                                  key=lambda x: x['target']),
+                'matrix': [{'target': t, 'exit': e, **fin(v)} for (t, e), v in mx.items()]}
+
     def close(self):
         with self._lock:
             self._db.close()
