@@ -1215,6 +1215,22 @@ async function recheckKeys(keys, label) {
   finalize(lastModel, seq, tRun);
 }
 
+function isGrey(c) { return !!c && !c.loading && !c.hardBlock && !c.code; }
+function isNon200(c) { return !!c && !c.loading && !c.hardBlock && !(c.code >= 200 && c.code < 300); }
+function keysBy(pred) {
+  const keys = new Set(), diList = activeDomainIdxs();
+  for (const r of lastModel.groups.flatMap(g => g.rows)) {
+    if (r.isMsg || isRowOkHidden(lastModel, r)) continue;
+    if (diList.some(di => pred(r.cells[di]))) keys.add(r.key);
+  }
+  return keys;
+}
+async function recheckBy(pred, label, emptyMsg) {
+  if (!lastModel) { alert('Сначала запустите полную проверку.'); return; }
+  const keys = keysBy(pred);
+  if (!keys.size) { log(emptyMsg, 'ok'); return; }
+  await recheckKeys(keys, label);
+}
 function failedKeys(rows, diList) {
   const keys = new Set();
   for (const r of rows) {
@@ -1382,6 +1398,8 @@ document.getElementById('btnRun').onclick = runAll;
 document.getElementById('btnCsv').onclick = exportCSV;
 document.getElementById('btnJson').onclick = exportJSON;
 document.getElementById('btnRecheckFailed').onclick = recheckFailed;
+document.getElementById('btnRecheckNon200').onclick = () => recheckBy(isNon200, 'перезапуск «не 200»', '↻ не 200: все точки ответили 2xx');
+document.getElementById('btnRecheckGrey').onclick = () => recheckBy(isGrey, 'перезапуск серых', '↻ серых (без ответа) нет');
 document.getElementById('btnWarmup').onclick = warmupLocal;
 document.getElementById('chkHide').checked = hideUnchecked;
 document.getElementById('chkHide').onchange = e => {
