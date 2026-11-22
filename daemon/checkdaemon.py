@@ -318,12 +318,23 @@ def start_core(ex):
     if not sb or not ex.get('cfg'):
         return False
     try:
-        proc = subprocess.Popen([sb, sb_mode, '-c', ex['cfg']],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=WORK)
+        errf = ex['cfg'] + '.err'
+        with open(errf, 'wb') as ef:
+            proc = subprocess.Popen([sb, sb_mode, '-c', ex['cfg']],
+                                    stdout=subprocess.DEVNULL, stderr=ef, cwd=WORK)
         ex['proc'] = proc
         time.sleep(0.4)
         if proc.poll() is not None:
-            ex['status'] = 'ядро не запустилось (см. конфиг)'
+            ex['status'] = 'ядро не запустилось'
+            try:
+                err = re.sub(r'\[[0-9;]*m', '', open(errf, encoding='utf-8', errors='ignore').read())
+                m = re.search(r'unknown transport type: (\w+)', err)
+                if m:
+                    ex['status'] = f'⚠ не поддерживается ядром sing-box: транспорт {m.group(1)}'
+                elif err.strip():
+                    ex['status'] = 'ядро не запустилось: ' + err.strip().splitlines()[-1][:160]
+            except OSError:
+                pass
             return False
         ex['status'] = f"127.0.0.1:{ex['port']}"
         return True
@@ -404,7 +415,7 @@ def control_check(ex):
         ex['status'] = f"OK {r.get('ms')}мс · exit {ip or '?'} ({loc or '??'})"
         if ex['geo'] == 'mismatch':
             ex['status'] += f" · ⚠ заявлена {ex.get('claimed') or '?'}"
-    else:
+    elif not str(ex.get('status') or '').startswith(('⚠ не поддерж', 'ядро не запустилось')):
         ex['status'] = '⚠ мёртв — ' + ((r.get('error') or r.get('note') or 'нет ответа')[:120])
     return {'code': r.get('code', 0), 'ms': r.get('ms'), 'ip': ip, 'loc': loc, 'ok': ok,
             'error': (r.get('error') or r.get('note') or '')[:200] if not ok else '',
