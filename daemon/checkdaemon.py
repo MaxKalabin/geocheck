@@ -367,7 +367,7 @@ def kill_exit(ex):
 
 
 def public_exits():
-    keys = ('id', 'label', 'port', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded')
+    keys = ('id', 'label', 'port', 'ok', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded')
     return [{k: e.get(k) for k in keys} for e in STATE['exits']]
 
 

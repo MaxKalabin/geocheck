@@ -54,10 +54,7 @@ def _cell(url, ex, cell):
 
 
 def exit_api(ex):
-    st = 'down' if (ex.get('excluded') or ex.get('ok') is False) else (
-        'up' if ex.get('status') in ('up', 'ok', 'direct') or ex.get('ok') else 'unknown')
-    if ex.get('status') == 'down':
-        st = 'down'
+    st = 'down' if (ex.get('excluded') or ex.get('ok') is False) else ('up' if ex.get('ok') else 'unknown')
     if ex.get('port', 1) is None and st == 'unknown':
         st = 'up'          # системный канал: контрольная проверка не нужна
     return {'id': ex['id'], 'label': ex.get('label') or ex['id'],
