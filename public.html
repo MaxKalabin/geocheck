@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GeoCheck — быстрая проверка доступности</title>
+<style>
+  :root{color-scheme:light dark;--ok:#1a7f37;--bad:#cf222e;--warn:#9a6700;--mut:#6e7781}
+  body{font:16px/1.5 system-ui,sans-serif;max-width:720px;margin:2rem auto;padding:0 1rem}
+  h1{font-size:1.5rem;margin:0 0 .25rem}
+  p.lead{color:var(--mut);margin:0 0 1rem}
+  textarea{width:100%;box-sizing:border-box;min-height:7rem;font:inherit;padding:.6rem;border-radius:8px;border:1px solid #8885}
+  button{font:inherit;padding:.55rem 1.2rem;border-radius:8px;border:0;background:#0969da;color:#fff;cursor:pointer;margin-top:.6rem}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse;margin-top:1rem}
+  td,th{text-align:left;padding:.45rem .5rem;border-bottom:1px solid #8883;vertical-align:top}
+  .ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}.warn{color:var(--warn);font-weight:600}
+  .mut{color:var(--mut);font-size:.9rem}
+  #msg{margin-top:.8rem;min-height:1.4em}
+</style>
+</head>
+<body>
+<h1>Проверка доступности</h1>
+<p class="lead">Домены и отдельные страницы, по одному адресу в строке (до 5). Проверка идёт с нашего сервера в Европе, без VPN.</p>
+<textarea id="t" placeholder="example.com&#10;https://example.com/page" spellcheck="false"></textarea>
+<button id="go">Проверить</button>
+<div id="msg" class="mut"></div>
+<table id="res" hidden><thead><tr><th>Адрес</th><th>Результат</th><th>Код</th><th>Время</th></tr></thead><tbody></tbody></table>
+<p class="mut">Проверка идёт из одной точки (дата-центр), а не из вашей сети: сайт, открывающийся здесь, может быть недоступен вам, и наоборот. Жёсткая защита сайта от ботов (например nginx 503) показывается отдельно и сбоем не считается.</p>
+<script>
+const L={ok:['работает','ok'],'network-error':['не отвечает','bad'],'server-error':['ошибка сервера 5xx','bad'],
+ blocked:['отказ 4xx','bad'],challenge:['проверка защиты (challenge)','warn'],slow:['медленно','warn'],
+ 'nginx-503':['защита от ботов (503)','warn'],'domain-down':['домен не грузится','bad'],'exit-down':['канал недоступен','warn']};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let timer;
+async function go(){
+  clearTimeout(timer);
+  const targets=$('t').value.split(/\s+/).filter(Boolean);
+  if(!targets.length){$('msg').textContent='введите хотя бы один адрес';return}
+  $('go').disabled=true;$('msg').textContent='проверяю…';$('res').hidden=true;
+  try{
+    const r=await fetch('/pub/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targets})});
+    const j=await r.json();
+    if(!r.ok){$('msg').textContent=j.error||('ошибка '+r.status);$('go').disabled=false;return}
+    poll(j.id,0);
+  }catch(e){$('msg').textContent='сервер не отвечает';$('go').disabled=false}
+}
+async function poll(id,n){
+  try{
+    const r=await fetch('/pub/job/'+id);const j=await r.json();
+    render(j);
+    if(['done','failed','cancelled'].includes(j.state)){$('go').disabled=false;$('msg').textContent=j.state==='done'?'готово':'проверка не завершилась';return}
+  }catch(e){}
+  if(n>120){$('msg').textContent='слишком долго, попробуйте ещё раз';$('go').disabled=false;return}
+  timer=setTimeout(()=>poll(id,n+1),1200);
+}
+function render(j){
+  $('res').hidden=false;
+  $('res').tBodies[0].innerHTML=j.results.map(r=>{
+    const l=r.status?(L[r.status]||[r.status,'warn']):['ждёт…','mut'];
+    return '<tr><td>'+esc(r.target)+'</td><td class="'+l[1]+'">'+esc(l[0])+(r.note?'<div class="mut">'+esc(r.note)+'</div>':'')+'</td><td>'+(r.code||'—')+'</td><td>'+(r.ms==null?'':(r.ms>=1000?(r.ms/1000).toFixed(1)+' с':r.ms+' мс'))+'</td></tr>';
+  }).join('');
+}
+$('go').onclick=go;
+</script>
+</body>
+</html>

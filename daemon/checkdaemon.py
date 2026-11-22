@@ -38,6 +38,8 @@ import tempfile
 import threading
 import time
 import urllib.request
+import ipaddress
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -46,6 +48,7 @@ sys.path.insert(0, HERE)
 
 from classify import (cell_status, claimed_country, classify_curl_error, curl_note,  # noqa: E402
                       geo_verdict, majority, normalize_target, root_of, site_verdict, symptom)
+import apiv1  # noqa: E402
 from jobs import JobManager  # noqa: E402
 from linkparse import parse_subscription  # noqa: E402
 from store import History  # noqa: E402
@@ -65,6 +68,13 @@ MAX_BODY = 1_000_000
 UA = 'GeoCheck/2.0 (availability checker)'
 ROOT = os.path.dirname(HERE)
 DATA_DIR = os.environ.get('RG_DATA_DIR') or os.path.join(ROOT, 'data')
+SECRETS_DIR = os.environ.get('RG_SECRETS_DIR') or ROOT   # subs.txt, user_nodes.txt
+PUBLIC_PORT = int(os.environ.get('RG_PUBLIC_PORT', '0') or 0)   # 0 = публичной части нет
+PUB_MAX_TARGETS = 5
+PUB_LIMIT_IP = (6, 600)          # не больше 6 проверок за 10 минут с одного адреса
+PUB_LIMIT_ALL = (60, 3600)       # и 60 в час на всех
+PUB_MAX_PENDING = 3
+FAKE_IP_NET = ipaddress.ip_network('198.18.0.0/15')
 STATIC_FILES = ('index.html', 'app.js', 'styles.css')
 LOOPBACK = ('127.0.0.1', 'localhost', '::1')
 # какие страницы вправе дёргать демон (CORS/Origin). Свои: RG_ORIGINS=https://geocheck.example.com,...
@@ -471,9 +481,11 @@ def run_job(job):
         slow_ms = max(1000, int(p.get('slowMs') or SLOW_MS_DEFAULT))
     except (TypeError, ValueError):
         slow_ms = SLOW_MS_DEFAULT
-    ensure_cores()
+    only = p.get('only')
+    if not only:
+        ensure_cores()
     with STATE['lock']:
-        exits = list(STATE['exits'])
+        exits = [e for e in STATE['exits'] if not only or e['id'] in only]
     targets = list(job.targets)
     job.total = len(exits) * len(targets)
     job.warnings.extend(STATE.get('warnings', [])[:5])
@@ -546,7 +558,7 @@ class H(BaseHTTPRequestHandler):
         if got.lower().startswith('bearer '):
             got = got[7:]
         else:
-            got = self.headers.get('X-GeoCheck-Token', '') or ''
+            got = self.headers.get('X-GeoCheck-Token', '') or self.headers.get('X-RG-Token', '') or ''
         return hmac.compare_digest(got.strip().encode(), TOKEN.encode())
 
     def _guard(self, api=True):
@@ -574,7 +586,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', origin if origin in ALLOWED_ORIGINS else 'null')
         self.send_header('Vary', 'Origin')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-GeoCheck-Token')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-GeoCheck-Token, X-RG-Token')
         self.send_header('Access-Control-Allow-Private-Network', 'true')
 
     def _json(self, obj, code=200):
@@ -643,6 +655,50 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # --- /api/*: контракт для app.js (docs/API.md)
+    def api_get(self, path):
+        qs = self.path.split('?', 1)[1] if '?' in self.path else ''
+        if path == '/exits':
+            return self._json({'exits': [apiv1.exit_api(e) for e in public_exits()]})
+        if path.startswith('/jobs/'):
+            job = JOBS.get(path[6:].strip('/'))
+            if not job:
+                return self._json({'error': 'нет такого задания'}, 404)
+            return self._json(apiv1.job_api(job.snapshot(full=True)))
+        if path == '/history':
+            try:
+                lim = int(dict(x.split('=', 1) for x in qs.split('&') if '=' in x).get('limit', 50))
+            except ValueError:
+                lim = 50
+            return self._json({'jobs': [apiv1.history_item(r) for r in HISTORY.list_runs(lim)]})
+        if path.startswith('/history/'):
+            run = HISTORY.get_run(path[9:].strip('/'))
+            if not run:
+                return self._json({'error': 'нет такого прогона'}, 404)
+            return self._json(apiv1.job_api(run))
+        return self._json({'error': 'unknown'}, 404)
+
+    def api_post(self, path):
+        try:
+            body = self._body()
+        except Exception:
+            return self._json({'error': 'bad json'}, 400)
+        if path == '/jobs':
+            urls, params = apiv1.request_to_params(body)
+            targets, bad = _targets(urls)
+            if not targets:
+                return self._json({'error': 'нет адресов'}, 400)
+            job = JOBS.create(targets, params)
+            return self._json({'id': job.id, 'state': job.status}, 202)
+        if path.startswith('/jobs/') and path.endswith('/cancel'):
+            jid = path[6:-7].strip('/')
+            job = JOBS.get(jid)
+            if not job:
+                return self._json({'error': 'нет такого задания'}, 404)
+            JOBS.cancel(jid)
+            return self._json(apiv1.job_api(job.snapshot(full=True)))
+        return self._json({'error': 'unknown'}, 404)
+
     # --- verbs
     def do_OPTIONS(self):
         if not self._guard(api=False):
@@ -657,8 +713,14 @@ class H(BaseHTTPRequestHandler):
             if not self._guard(api=False):
                 return
             return self._static(path)
+        if path == '/api/health':
+            if not self._guard(api=False):
+                return
+            return self._json({'ok': True, 'version': VERSION})
         if not self._guard():
             return
+        if path.startswith('/api/'):
+            return self.api_get(path[4:])
         if path.startswith('/fwd'):
             return self.fwd_request('GET')
         if path == '/status':
@@ -688,6 +750,8 @@ class H(BaseHTTPRequestHandler):
             return
         if path.startswith('/fwd'):
             return self.fwd_request('POST')
+        if path.startswith('/api/'):
+            return self.api_post(path[4:])
         try:
             body = self._body()
         except ValueError as e:
@@ -734,6 +798,147 @@ class H(BaseHTTPRequestHandler):
         return self._json({'ok': False, 'error': 'unknown'}, 404)
 
 
+# ---------------------------------------------------------------- публичная часть
+PUB = {'jobs': set(), 'hits': {}, 'all': [], 'lock': threading.Lock()}
+
+
+def ssrf_reason(target):
+    """Почему публичному посетителю нельзя проверять этот адрес (или '' если можно)."""
+    from urllib.parse import urlparse
+    p = urlparse(target)
+    host = (p.hostname or '').lower()
+    if p.port not in (None, 80, 443):
+        return 'допустимы только порты 80 и 443'
+    if not host or '.' not in host or host.endswith(('.local', '.internal', '.lan', '.ts.net', '.localhost')):
+        return 'нужен публичный домен'
+    try:
+        ipaddress.ip_address(host)
+        return 'IP-адреса не принимаются, укажите домен'
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return ''            # не резолвится: это и есть результат проверки, внутрь он не ведёт
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split('%')[0])
+            if ip in FAKE_IP_NET:      # fake-ip у VPN-клиентов (198.18/15): наружу не маршрутизируется
+                continue
+            if not ip.is_global:
+                return 'домен указывает на внутренний адрес'
+        except ValueError:
+            return 'странный адрес'
+    return ''
+
+
+def pub_rate_ok(key, now=None):
+    now = now or time.time()
+    with PUB['lock']:
+        PUB['all'] = [t for t in PUB['all'] if now - t < PUB_LIMIT_ALL[1]]
+        hits = [t for t in PUB['hits'].get(key, []) if now - t < PUB_LIMIT_IP[1]]
+        if len(hits) >= PUB_LIMIT_IP[0] or len(PUB['all']) >= PUB_LIMIT_ALL[0]:
+            PUB['hits'][key] = hits
+            return False
+        hits.append(now)
+        PUB['hits'][key] = hits
+        PUB['all'].append(now)
+        if len(PUB['hits']) > 2000:
+            PUB['hits'] = {k: v for k, v in PUB['hits'].items() if v and now - v[-1] < PUB_LIMIT_IP[1]}
+        return True
+
+
+def pub_view(job):
+    snap = job.snapshot(full=True)
+    rows = []
+    for t in snap['targets']:
+        cell = None
+        for cells in snap['results'].values():
+            cell = cells.get(t) or cell
+        row = {'target': t}
+        if cell:
+            row.update({'status': apiv1.api_status(cell), 'code': cell.get('code') or 0, 'ms': cell.get('ms'),
+                        'note': cell.get('symptom') or cell.get('note') or ''})
+        rows.append(row)
+    state = {'error': 'failed'}.get(snap['status'], snap['status'])
+    return {'id': snap['id'], 'state': state, 'results': rows}
+
+
+class P(BaseHTTPRequestHandler):
+    """Публичный обработчик: форма проверки и больше ничего. Слушает loopback, наружу его выводит Tailscale Funnel."""
+    server_version = 'GeoCheck-public'
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, obj, code=200, ctype='application/json; charset=utf-8', raw=None):
+        body = raw if raw is not None else json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Content-Security-Policy',
+                         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _client(self):
+        xff = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+        return xff or self.client_address[0]
+
+    def do_GET(self):
+        path = self.path.split('?', 1)[0]
+        if path in ('/', '/index.html'):
+            try:
+                with open(os.path.join(ROOT, 'public.html'), 'rb') as f:
+                    return self._send(None, ctype='text/html; charset=utf-8', raw=f.read())
+            except OSError:
+                return self._send({'error': 'unknown'}, 404)
+        if path.startswith('/pub/job/'):
+            jid = path[9:].strip('/')
+            job = JOBS.get(jid) if jid in PUB['jobs'] else None
+            if not job:
+                return self._send({'error': 'нет такой проверки'}, 404)
+            return self._send(pub_view(job))
+        return self._send({'error': 'unknown'}, 404)
+
+    def do_POST(self):
+        if self.path.split('?', 1)[0] != '/pub/check':
+            return self._send({'error': 'unknown'}, 404)
+        try:
+            n = int(self.headers.get('Content-Length', '0') or 0)
+            if n > 4096:
+                return self._send({'error': 'слишком большой запрос'}, 413)
+            body = json.loads(self.rfile.read(n) or b'{}')
+        except Exception:
+            return self._send({'error': 'bad json'}, 400)
+        raw = body.get('targets') or []
+        if isinstance(raw, str):
+            raw = raw.split()
+        targets, bad = _targets(list(raw)[:PUB_MAX_TARGETS + 5])
+        if not targets:
+            return self._send({'error': 'введите домен или адрес страницы'}, 400)
+        if len(targets) > PUB_MAX_TARGETS:
+            return self._send({'error': f'не больше {PUB_MAX_TARGETS} адресов за раз'}, 400)
+        for t in targets:
+            why = ssrf_reason(t)
+            if why:
+                return self._send({'error': f'{t}: {why}'}, 400)
+        with PUB['lock']:
+            ids = list(PUB['jobs'])
+        pending = sum(1 for j in ids if JOBS.get(j) and JOBS.get(j).status in ('queued', 'running'))
+        if pending >= PUB_MAX_PENDING:
+            return self._send({'error': 'сейчас очередь занята, попробуйте через минуту'}, 429)
+        if not pub_rate_ok(self._client()):
+            return self._send({'error': 'слишком много проверок, подождите несколько минут'}, 429)
+        job = JOBS.create(targets, {'browser': False, 'repeats': 1, 'only': ['direct'], 'public': True})
+        with PUB['lock']:
+            PUB['jobs'].add(job.id)
+        return self._send({'id': job.id}, 202)
+
+
 def _params(body):
     return {'browser': bool(body.get('browser')), 'domainFirst': bool(body.get('domainFirst')),
             'repeats': body.get('repeats'), 'slowMs': body.get('slowMs')}
@@ -744,7 +949,7 @@ def load_local_files():
     """subs.txt и user_nodes.txt рядом с проектом. Файлы читает только демон; содержимое не выводится."""
     urls, inline = [], []
     for name in ('subs.txt', 'user_nodes.txt'):
-        path = os.path.join(ROOT, name)
+        path = os.path.join(SECRETS_DIR, name)
         if not os.path.exists(path):
             continue
         for line in open(path, encoding='utf-8', errors='ignore').read().splitlines():
@@ -787,6 +992,10 @@ def main():
             print('WARN:', w)
     mode = 'с токеном' if TOKEN else 'только loopback, без токена'
     print(f'GeoCheck daemon {VERSION}: http://{BIND}:{PORT}  ({mode}; секреты не сохраняются)', flush=True)
+    if PUBLIC_PORT:
+        pub = ThreadingHTTPServer(('127.0.0.1', PUBLIC_PORT), P)
+        threading.Thread(target=pub.serve_forever, daemon=True).start()
+        print(f'Публичная форма: 127.0.0.1:{PUBLIC_PORT} (наружу только через Tailscale Funnel)', flush=True)
     ThreadingHTTPServer((BIND, PORT), H).serve_forever()
 
 
