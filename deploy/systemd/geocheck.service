@@ -11,6 +11,7 @@ WorkingDirectory=__HOME__/geocheck/current
 EnvironmentFile=__HOME__/geocheck/secrets/geocheck.env
 Environment=RG_DAEMON_PORT=__PORT__
 Environment=RG_BIND=0.0.0.0
+Environment=RG_PUBLIC_PORT=8788
 Environment=RG_SECRETS_DIR=__HOME__/geocheck/secrets
 Environment=RG_DATA_DIR=__HOME__/geocheck/data
 Environment=TMPDIR=__HOME__/geocheck/tmp
