@@ -10,6 +10,9 @@ Group=__USER__
 EnvironmentFile=__HOME__/geocheck/secrets/geocheck.env
 Environment=RG_DAEMON_PORT=__PORT__
 Environment=RG_DATA_DIR=__HOME__/geocheck/data
+Environment=TMPDIR=__HOME__/geocheck/tmp
+Environment=XDG_CACHE_HOME=__HOME__/geocheck/cache
+Environment=PLAYWRIGHT_BROWSERS_PATH=__HOME__/geocheck/cache/ms-playwright
 Environment=RG_SCAN_DOMAINS=__HOME__/geocheck/config/domains.txt
 ExecStart=__HOME__/geocheck/venv/bin/python __HOME__/geocheck/current/deploy/scheduled_run.py
 TimeoutStartSec=2h

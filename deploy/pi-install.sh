@@ -7,6 +7,7 @@ PORT="${2:-8787}"
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.4}"
 BASE="$HOME/geocheck"
 cd "$BASE"
+mkdir -p "$HOME/geocheck/cache/pip" "$HOME/geocheck/tmp"
 mkdir -p bin data/runs config secrets
 chmod 700 secrets
 
@@ -16,8 +17,8 @@ ln -sfn "releases/$REV" current
 # 1. Python venv with the daemon's optional requirements (Playwright; no browser download,
 #    the daemon uses the system chromium through RG_CHROMIUM_PATH).
 if [ ! -x venv/bin/python ]; then python3 -m venv venv; fi
-venv/bin/pip install -q --upgrade pip
-venv/bin/pip install -q -r current/deploy/requirements.txt
+PIP_CACHE_DIR=$HOME/geocheck/cache/pip TMPDIR=$HOME/geocheck/tmp venv/bin/pip install -q --upgrade pip
+PIP_CACHE_DIR=$HOME/geocheck/cache/pip TMPDIR=$HOME/geocheck/tmp venv/bin/pip install -q -r current/deploy/requirements.txt
 echo "[pi] venv ok: $(venv/bin/python -c 'import playwright, importlib.metadata as m; print("playwright", m.version("playwright"))' 2>/dev/null || echo 'playwright import failed')"
 
 # 2. sing-box core for linux (arm64 on this Pi). Pinned version.

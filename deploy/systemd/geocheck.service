@@ -13,6 +13,9 @@ Environment=RG_DAEMON_PORT=__PORT__
 Environment=RG_BIND=0.0.0.0
 Environment=RG_SECRETS_DIR=__HOME__/geocheck/secrets
 Environment=RG_DATA_DIR=__HOME__/geocheck/data
+Environment=TMPDIR=__HOME__/geocheck/tmp
+Environment=XDG_CACHE_HOME=__HOME__/geocheck/cache
+Environment=PLAYWRIGHT_BROWSERS_PATH=__HOME__/geocheck/cache/ms-playwright
 Environment=SINGBOX_PATH=__HOME__/geocheck/bin/sing-box
 Environment=RG_CHROMIUM_PATH=/usr/bin/chromium
 ExecStart=__HOME__/geocheck/venv/bin/python daemon/checkdaemon.py
