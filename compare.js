@@ -68,7 +68,7 @@ async function load() {
     if (!DATA.ok) throw new Error(DATA.error || r.status);
   } catch (e) { document.getElementById('meta').textContent = 'не удалось загрузить: ' + (e.message || e); return; }
   render();
-  if (!PUBLIC) loadErrors(days);
+  loadErrors(days);
 }
 const KIND = { nginx: '🛑 NGINX 503', unreachable: '⛔ недоступна', exit_down: 'выход не отвечал', http: 'ошибка HTTP' };
 async function loadErrors(days) {

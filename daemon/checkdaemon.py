@@ -1203,6 +1203,10 @@ class P(BaseHTTPRequestHandler):
             return self._send({'ok': True, 'model': load_lastmodel('pub')})
         if path == '/activity':
             return self._send({'ok': True, 'activity': activity_get()})
+        if path == '/errors':
+            dflt = [d.rstrip('/') for d in PUB_DEFAULT_TARGETS]
+            errs = [e for e in HISTORY.errors(_days(self.path)) if str(e.get('target', '')).rstrip('/') in dflt]
+            return self._send({'ok': True, 'errors': errs})
         if path == '/stats':
             dflt = [d.rstrip('/') for d in PUB_DEFAULT_TARGETS]
             st = HISTORY.stats(_days(self.path), only_target=lambda t, p: not p.get('public') or t.rstrip('/') in dflt)

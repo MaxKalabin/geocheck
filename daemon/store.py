@@ -181,9 +181,25 @@ class History:
                 'FROM cells c JOIN runs r ON r.id = c.run_id '
                 "WHERE r.created >= ? AND c.status NOT IN ('ok','skipped') ORDER BY r.created DESC LIMIT ?",
                 (since, int(limit))).fetchall()
+            known = {}
+            for kr in self._db.execute(
+                    "SELECT exit_label, exit_id, result FROM cells WHERE result LIKE '%\"exitIp\": \"_%' "
+                    'ORDER BY rowid DESC LIMIT 20000').fetchall():
+                key = kr['exit_label'] or kr['exit_id']
+                if key not in known:
+                    try:
+                        kj = json.loads(kr['result'])
+                        if kj.get('exitIp'):
+                            known[key] = (kj['exitIp'], kj.get('exitLoc') or '')
+                    except ValueError:
+                        pass
         out = []
         for r in rows:
             res = json.loads(r['result'])
+            if not res.get('exitIp'):
+                kip = known.get(r['exit_label'] or r['exit_id'])
+                if kip:
+                    res['exitIp'], res['exitLoc'] = kip[0], (kip[1] + ' · последний известный') if kip[1] else 'последний известный'
             st = r['status']
             if st == 'geo_mismatch':
                 st = res.get('rawStatus') or 'fail'

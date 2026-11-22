@@ -140,15 +140,16 @@ function actPost(body) {
 }
 const SPIN_CHARS = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 let spinIdx = 0;
-function startRunIndicator(label) {
+function startRunIndicator(label, limitSec) {
   stopRunIndicator();
   const t0 = Date.now();
+  const cd = t => { if (!limitSec) return ''; const left = Math.ceil(limitSec - (Date.now() - t) / 1000); return left > 0 ? ` · таймер ответа: осталось ${left} с` : ' · таймер вышел, дожидаюсь результата…'; };
   actLabel = label;
   const beat = () => actPost({ label: actLabel, text: curPhase });
   beat(); actBeat = setInterval(beat, 4000);
   runTick = setInterval(() => {
     const el = document.getElementById('lastAction');
-    if (el) el.textContent = `${SPIN_CHARS[spinIdx++ % SPIN_CHARS.length]} ${label} — идёт проверка, ${((Date.now() - t0) / 1000).toFixed(0)} с…`;
+    if (el) el.textContent = `${SPIN_CHARS[spinIdx++ % SPIN_CHARS.length]} ${label} — идёт проверка, ${((Date.now() - t0) / 1000).toFixed(0)} с…${cd(t0)}`;
     document.title = `⏳ ${((Date.now() - t0) / 1000).toFixed(0)} с · GeoCheck`;
   }, 250);
 }
@@ -1208,7 +1209,7 @@ async function reCheckSource(id) {
   if (!keys.size) { log(`перепроверка ${g.title}: нет выбранных точек`, 'warn'); return; }
   log(`↻ перепроверка источника «${g.title}»: ${keys.size} точек × ${diList.length} домен(ов)`);
   setAction(`перепроверяю «${g.title}»…`);
-  startRunIndicator(`перепроверка «${g.title}»`);
+  startRunIndicator(`перепроверка «${g.title}»`, 60);
   markLoading(lastModel, diList, keys);
   renderRows(lastModel);
   if (id === 'local') await runLocal(lastModel, seq, diList, keys);
@@ -1229,7 +1230,7 @@ async function recheckKeys(keys, label) {
   const rf = new Set(keys);
   log(`↻ ${label}: ${keys.size} точек × ${diList.length} домен(ов)`);
   setAction(`${label}…`);
-  startRunIndicator(label);
+  startRunIndicator(label, 60);
   markLoading(lastModel, diList, rf);
   renderRows(lastModel);
   await runLocal(lastModel, seq, diList, rf);
@@ -1306,7 +1307,7 @@ async function reCheckCell(key, di) {
   renderRows(lastModel);
   log(`⟳ ячейка: «${r.title}» × ${shortDomain(lastModel.domains[di])}`);
   setAction(`перепроверяю одну ячейку…`);
-  startRunIndicator('перепроверка ячейки');
+  startRunIndicator('перепроверка ячейки', 60);
   const rf = new Set([key]);
   if (key.startsWith('ch:')) await runCh(lastModel, seq, [di], rf);
   else if (key.startsWith('gp:')) await runGp(lastModel, seq, [di], rf);
