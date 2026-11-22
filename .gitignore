@@ -3,3 +3,11 @@ user_nodes.txt
 run_analysis.json
 node_modules/
 __pycache__/
+_archive/
+secrets/
+*.env
+!geocheck.env.example
+data/
+run_*.json
+*.log
+*.err

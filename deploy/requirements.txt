@@ -1,0 +1,2 @@
+# Optional browser probe (daemon/browser_probe.py). Uses system chromium via RG_CHROMIUM_PATH.
+playwright>=1.47

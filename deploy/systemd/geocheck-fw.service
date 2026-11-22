@@ -1,0 +1,12 @@
+[Unit]
+Description=GeoCheck firewall: port __PORT__ only from LAN, Tailscale and loopback
+After=network-pre.target
+Before=geocheck.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=__HOME__/geocheck/current/deploy/firewall.sh __PORT__
+
+[Install]
+WantedBy=multi-user.target

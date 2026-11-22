@@ -1,0 +1,10 @@
+[Unit]
+Description=GeoCheck scheduled run twice a day (Pi local time)
+
+[Timer]
+OnCalendar=*-*-* 03,15:00:00
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

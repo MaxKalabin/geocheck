@@ -1,0 +1,27 @@
+[Unit]
+Description=GeoCheck daemon (domain and page availability checks)
+After=network-online.target geocheck-fw.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__HOME__/geocheck/current
+EnvironmentFile=__HOME__/geocheck/secrets/geocheck.env
+Environment=RG_DAEMON_PORT=__PORT__
+Environment=RG_BIND=0.0.0.0
+Environment=RG_SECRETS_DIR=__HOME__/geocheck/secrets
+Environment=RG_DATA_DIR=__HOME__/geocheck/data
+Environment=SINGBOX_PATH=__HOME__/geocheck/bin/sing-box
+Environment=RG_CHROMIUM_PATH=/usr/bin/chromium
+ExecStart=__HOME__/geocheck/venv/bin/python daemon/checkdaemon.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=__HOME__/geocheck/data
+
+[Install]
+WantedBy=multi-user.target

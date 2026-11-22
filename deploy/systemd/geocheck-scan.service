@@ -1,0 +1,15 @@
+[Unit]
+Description=GeoCheck scheduled run (domains from config/domains.txt)
+After=geocheck.service
+Requires=geocheck.service
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+EnvironmentFile=__HOME__/geocheck/secrets/geocheck.env
+Environment=RG_DAEMON_PORT=__PORT__
+Environment=RG_DATA_DIR=__HOME__/geocheck/data
+Environment=RG_SCAN_DOMAINS=__HOME__/geocheck/config/domains.txt
+ExecStart=__HOME__/geocheck/venv/bin/python __HOME__/geocheck/current/deploy/scheduled_run.py
+TimeoutStartSec=2h
