@@ -9,5 +9,6 @@ secrets/
 !geocheck.env.example
 data/
 run_*.json
+!tests/fixtures/run_*.json
 *.log
 *.err

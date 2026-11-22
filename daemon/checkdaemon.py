@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GeoCheck local daemon — локальный помощник дашборда.
+GeoCheck daemon — проверка доступности доменов и страниц через выходы (VPN-ядра sing-box + системный канал).
 
 Что делает:
-  * читает URL VPN-подписок (env RG_SUBS или POST /set_subscriptions) — ТОЛЬКО в памяти;
-  * извлекает конфиги прокси (vless/vmess/trojan/ss, формат share-link или sing-box JSON);
-  * поднимает sing-box-ядра на 127.0.0.1:порты (системный трафик НЕ трогает — tun не создаёт,
-    работающий VPN-клиент (Throne/Hiddify) не мешает);
-  * гоняет curl-замеры доменов через каждый выход и отдаёт результаты дашборду.
+  * читает подписки (env RG_SUBS, subs.txt, POST /set_subscriptions) и ссылки из user_nodes.txt — ТОЛЬКО в памяти;
+  * разбирает конфиги (parse в linkparse.py), поднимает ядра sing-box на 127.0.0.1:порты (tun не создаёт);
+  * перед замерами проверяет каждый выход контрольным сайтом (RG_CONTROL_URL): не прошёл — «выход не работает»;
+    сверяет страну, которую видит Cloudflare, с названием ноды (GeoIP);
+  * меряет каждую цель 1–3 раза и берёт большинство; выход, который N раз подряд не прошёл контроль,
+    исключается (RG_EXCLUDE_AFTER);
+  * прогоны — асинхронные задания (POST /jobs, GET /jobs/<id>, отмена), история в SQLite (data/history.db);
+  * отдаёт дашборд сам (index.html, app.js, styles.css), Node не нужен.
 
-Секреты: ни в каких файлах и логах не сохраняются; при убийстве процесса забываются.
-Слушает только 127.0.0.1 — снаружи недоступен по построению.
+Секреты: подписки и конфиги не пишутся ни на диск, ни в историю, ни в логи. Токен доступа — только в env.
+
+Переменные окружения:
+  RG_DAEMON_PORT (8787)   RG_BIND (127.0.0.1)   RG_TOKEN (пусто = только loopback без токена)
+  RG_SUBS, RG_MAX_EXITS (40), RG_IFACE (выключено), SINGBOX_PATH, SINGBOX_MODE (run|srun)
+  RG_CONTROL_URL (https://www.cloudflare.com/cdn-cgi/trace), RG_REPEATS (3), RG_EXCLUDE_AFTER (3)
+  RG_DATA_DIR (ROOT/data), RG_ORIGINS (доп. разрешённые Origin через запятую)
 
 Запуск:
-  python daemon/checkdaemon.py              # порт по умолчанию 8787
-  set RG_SUBS=https://...;https://...        # необязательно — можно передать из дашборда
-  set SINGBOX_PATH=C:\\path\\sing-box.exe   # если ядро не найдено автоматически
+  python daemon/checkdaemon.py
+  RG_BIND=0.0.0.0 RG_TOKEN=... python daemon/checkdaemon.py   # в LAN / Tailscale, только с токеном
 """
 import atexit
-import base64
 import glob
+import hmac
 import json
 import os
 import re
@@ -34,188 +41,85 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+from classify import (cell_status, claimed_country, classify_curl_error, curl_note,  # noqa: E402
+                      geo_verdict, majority, normalize_target, root_of, site_verdict, symptom)
+from jobs import JobManager  # noqa: E402
+from linkparse import parse_subscription  # noqa: E402
+from store import History  # noqa: E402
+
+VERSION = '2.0'
 PORT = int(os.environ.get('RG_DAEMON_PORT', '8787'))
+BIND = os.environ.get('RG_BIND', '127.0.0.1').strip() or '127.0.0.1'
+TOKEN = os.environ.get('RG_TOKEN', '').strip()
 BASE_PORT = 21000
 MAX_EXITS = int(os.environ.get('RG_MAX_EXITS', '40'))
-UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) GeoCheck/1.0'
-CURL = shutil.which('curl') or shutil.which('curl.exe')
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# приватная временная папка: конфиги ядер содержат учётные данные прокси
-WORK = tempfile.mkdtemp(prefix='geocheck-')
-# какие страницы вправе дёргать демон (CORS/Origin). Добавить свои: RG_ORIGINS=https://geocheck.example.com,...
+REPEATS_DEFAULT = int(os.environ.get('RG_REPEATS', '3'))
+EXCLUDE_AFTER = int(os.environ.get('RG_EXCLUDE_AFTER', '3'))
+CONTROL_URL = os.environ.get('RG_CONTROL_URL', 'https://www.cloudflare.com/cdn-cgi/trace').strip()
+SLOW_MS_DEFAULT = 10000
+MAX_TARGETS = 500
+MAX_BODY = 1_000_000
+UA = 'GeoCheck/2.0 (availability checker)'
+ROOT = os.path.dirname(HERE)
+DATA_DIR = os.environ.get('RG_DATA_DIR') or os.path.join(ROOT, 'data')
+STATIC_FILES = ('index.html', 'app.js', 'styles.css')
+LOOPBACK = ('127.0.0.1', 'localhost', '::1')
+# какие страницы вправе дёргать демон (CORS/Origin). Свои: RG_ORIGINS=https://geocheck.example.com,...
 ALLOWED_ORIGINS = {'http://127.0.0.1:7100', 'http://localhost:7100'}
 ALLOWED_ORIGINS |= {o.strip().rstrip('/') for o in os.environ.get('RG_ORIGINS', '').split(',') if o.strip()}
 
+WORK = None          # приватная временная папка (конфиги ядер); создаётся в main()
+JOBS = None          # JobManager; создаётся в main()
+HISTORY = None
+
 STATE = {
     'subs_urls': [u for u in re.split(r'[\n;]', os.environ.get('RG_SUBS', '')) if u.strip()],
-    'exits': [],          # [{'id','label','port','status','proc','cfg'}]
+    'exits': [],     # [{'id','label','port','status','proc','cfg','claimed','fails','excluded','exit_ip','exit_loc','geo'}]
     'lock': threading.Lock(),
+    'warnings': [],
 }
 
+
 # ---------------------------------------------------------------- sing-box
+def curl_bin():
+    return shutil.which('curl') or shutil.which('curl.exe')
+
+
+def _mode_for(exe):
+    env = os.environ.get('SINGBOX_MODE', '').strip()
+    if env in ('run', 'srun'):
+        return env
+    return 'srun' if 'hiddify' in os.path.basename(exe).lower() else 'run'
+
+
 def find_singbox():
-    """Возвращает (exe, mode): mode='run' для sing-box, 'srun' для HiddifyCore (hiddify-sing-box)."""
-    env = os.environ.get('SINGBOX_PATH')
+    """Возвращает (exe, mode). Порядок: SINGBOX_PATH → PATH → (Windows) установки Hiddify/Program Files."""
+    env = os.environ.get('SINGBOX_PATH', '').strip()
     if env and os.path.exists(env):
-        mode = 'srun' if 'hiddify' in env.lower() else 'run'
-        return env, mode
-    roots = [
-        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs'),
-        r'C:\Program Files', r'C:\Program Files (x86)',
-    ]
+        return env, _mode_for(env)
     for name in ('sing-box', 'sing-box.exe', 'HiddifyCore', 'HiddifyCore.exe'):
         found = shutil.which(name)
         if found:
-            return found, ('srun' if 'hiddify' in name.lower() else 'run')
-    candidates = []
-    for root in roots:
-        for d in glob.glob(os.path.join(root, 'Hiddify*')) + glob.glob(os.path.join(root, '*hiddify*')):
-            candidates += glob.glob(os.path.join(d, '**', 'sing-box*.exe'), recursive=True)
-            candidates += glob.glob(os.path.join(d, '**', 'HiddifyCore.exe'), recursive=True)
-    for exe in candidates:
-        return exe, ('srun' if 'hiddify' in os.path.basename(exe).lower() else 'run')
+            return found, _mode_for(found)
+    if os.name == 'nt':
+        roots = [os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs'),
+                 r'C:\Program Files', r'C:\Program Files (x86)']
+        for root in roots:
+            for d in glob.glob(os.path.join(root, 'Hiddify*')) + glob.glob(os.path.join(root, '*hiddify*')):
+                for pat in ('sing-box*.exe', 'HiddifyCore.exe'):
+                    for exe in glob.glob(os.path.join(d, '**', pat), recursive=True):
+                        return exe, _mode_for(exe)
     return None, None
 
 
-def _b64d(s):
-    s = s.strip().replace('-', '+').replace('_', '/')
-    s += '=' * (-len(s) % 4)
-    return base64.b64decode(s)
-
-
-def parse_subscription(text):
-    """Возвращает список outbound-словарей для sing-box."""
-    text = text.strip()
-    outs = []
-    if text.startswith('{'):
-        try:
-            j = json.loads(text)
-            for o in j.get('outbounds', []):
-                if o.get('type') in ('vless', 'vmess', 'trojan', 'shadowsocks') and o.get('server'):
-                    outs.append(o)
-        except Exception:
-            pass
-        if outs:
-            return outs
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not re.search(r'^(vless|vmess|trojan|ss)://', text, re.I | re.M):   # не открытые ссылки → base64
-        try:
-            lines = [l.strip() for l in _b64d(text).decode('utf-8', 'ignore').splitlines() if l.strip()]
-        except Exception:
-            pass
-    for line in lines:
-        o = parse_share_link(line)
-        if o:
-            outs.append(o)
-    return outs
-
-
-def parse_share_link(line):
-    m = re.match(r'^(vless|vmess|trojan|ss)://(.+)$', line, re.I)
-    if not m:
-        return None
-    scheme = m.group(1).lower()
-    rest = m.group(2)
-    name = ''
-    if '#' in rest:
-        rest, frag = rest.split('#', 1)
-        from urllib.parse import unquote as _u
-        name = _u(frag)
-    from urllib.parse import urlparse, parse_qs, unquote
-    try:
-        if scheme == 'vmess':
-            j = json.loads(_b64d(rest).decode('utf-8', 'ignore'))
-            o = {'type': 'vmess', 'tag': 'proxy', 'server': j['add'], 'server_port': int(j['port']),
-                 'uuid': j['id'], 'security': 'auto'}
-            if j.get('tls'):
-                o['tls'] = {'enabled': True, 'server_name': j.get('sni') or j['add'], 'insecure': False}
-            if j.get('net') == 'ws':
-                o['transport'] = {'type': 'ws', 'path': j.get('path', '/'),
-                                  'headers': {'Host': j.get('host') or j['add']}}
-            o['_name'] = j.get('ps') or name
-            return o
-        u = urlparse(f'{scheme}://{rest}')
-        qs = {k: v[0] for k, v in parse_qs(u.query).items()}
-        if scheme == 'vless':
-            o = {'type': 'vless', 'tag': 'proxy', 'server': u.hostname,
-                 'server_port': u.port or 443, 'uuid': u.username}
-            if qs.get('flow'):
-                o['flow'] = qs['flow']
-            sec = qs.get('security', '')
-            if sec in ('tls', 'reality'):
-                tls = {'enabled': True, 'server_name': qs.get('sni') or u.hostname, 'insecure': False,
-                       'utls': {'enabled': True, 'fingerprint': 'chrome'}}
-                if sec == 'reality' and qs.get('pbk'):
-                    tls['reality'] = {'enabled': True, 'public_key': qs['pbk'],
-                                      'short_id': qs.get('sid', '')}
-                o['tls'] = tls
-            ttype = qs.get('type', '')
-            if ttype in ('ws', 'websocket'):
-                o['transport'] = {'type': 'ws', 'path': qs.get('path', '/'),
-                                  'headers': {'Host': qs.get('host') or qs.get('sni') or u.hostname}}
-            elif ttype == 'grpc':
-                o['transport'] = {'type': 'grpc', 'service_name': qs.get('serviceName', '')}
-                if qs.get('packetEncoding'):
-                    o['packet_encoding'] = qs['packetEncoding']   # обычно xudp
-            elif ttype == 'httpupgrade':
-                o['transport'] = {'type': 'httpupgrade', 'path': qs.get('path', '/')}
-                host = qs.get('host') or qs.get('sni') or u.hostname
-                if host:
-                    o['transport']['host'] = host
-            elif ttype in ('xhttp', 'splithttp'):
-                # xhttp (sing-box ≥1.12): path + mode; host — отдельным полем
-                # (headers.Host на этом форке даёт FATAL "headers can't contain host")
-                o['transport'] = {'type': 'xhttp', 'path': qs.get('path', '/')}
-                if qs.get('mode'):
-                    o['transport']['mode'] = qs['mode']
-                host = qs.get('host') or qs.get('sni') or u.hostname
-                if host:
-                    o['transport']['host'] = host
-            o['_name'] = unquote(name or '')
-            return o
-        if scheme == 'trojan':
-            o = {'type': 'trojan', 'tag': 'proxy', 'server': u.hostname,
-                 'server_port': u.port or 443, 'password': unquote(u.username or '')}
-            tls = {'enabled': True, 'server_name': qs.get('sni') or u.hostname, 'insecure': False,
-                   'utls': {'enabled': True, 'fingerprint': 'chrome'}}
-            if qs.get('allowInsecure') == '1':
-                tls['insecure'] = True
-            o['tls'] = tls
-            if qs.get('type') in ('ws', 'websocket'):
-                o['transport'] = {'type': 'ws', 'path': qs.get('path', '/'),
-                                  'headers': {'Host': qs.get('host') or qs.get('sni') or u.hostname}}
-            o['_name'] = unquote(name or '')
-            return o
-        if scheme == 'ss':
-            userinfo = u.username or ''
-            try:
-                method, pwd = _b64d(userinfo).decode().split(':', 1)
-            except Exception:
-                method, pwd = userinfo, unquote(u.password or '')
-            o = {'type': 'shadowsocks', 'tag': 'proxy', 'server': u.hostname,
-                 'server_port': u.port or 8388, 'method': method, 'password': pwd}
-            o['_name'] = unquote(name or '')
-            return o
-    except Exception:
-        return None
-    return None
-
-
-IFACE_CACHE = [None, False]  # [name, probed]
-
-
 def find_physical_interface():
-    """Физический интерфейс для route.default_interface sing-box — ТОЛЬКО если задан
-    RG_IFACE (например RG_IFACE=Ethernet). По умолчанию выключено: на машине с
-    активным tun-VPN (Throne/sing-box-форк) привязка ломает ВЕСЬ исходящий трафик
-    ядра (проверено 2026-11-21), а без привязки tun-exit режет reality-TLS.
-    Полноценно работает на чистой машине девопсов без конфликтующего VPN."""
-    if IFACE_CACHE[1]:
-        return IFACE_CACHE[0]
-    IFACE_CACHE[1] = True
+    """Физический интерфейс для route.default_interface — ТОЛЬКО по RG_IFACE. По умолчанию выключено:
+    на машине с активным tun-VPN привязка ломает исходящий трафик ядра (проверено 2026-11-21)."""
     env = os.environ.get('RG_IFACE', '').strip()
     if env and env.lower() != 'off':
-        IFACE_CACHE[0] = env
         return env
     return None
 
@@ -233,7 +137,6 @@ def sb_config(proxy, port):
     }
     iface = find_physical_interface()
     if iface:
-        # bind исходящих соединений к физическому адаптеру — мимо tun-VPN
         cfg['route'] = {'default_interface': iface, 'auto_detect_interface': False}
     return cfg, name
 
@@ -262,17 +165,22 @@ def resolve_ipv4(host):
 
 # ---------------------------------------------------------------- curl probe
 def probe(url, port=None, capture_body=False):
-    """curl-замер; port=None → системный маршрут (через текущий VPN).
-    capture_body=True — вернуть тело ответа в res['body'] (для прогрева/exit-IP)."""
+    """curl-замер; port=None → системный маршрут. capture_body=True — тело в res['body'] (для GeoIP)."""
+    curl = curl_bin()
+    if not curl:
+        return {'code': 0, 'note': 'curl не найден', 'errorKind': 'other'}
     if not re.match(r'^https?://\S+$', url or '', re.I):
-        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)', 'error': 'bad url'}
-    tmp = WORK
-    hdr = os.path.join(tmp, f'geocheck-h-{threading.get_ident()}.txt')
-    body_f = os.path.join(tmp, f'geocheck-b-{threading.get_ident()}.txt')
+        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)', 'errorKind': 'other'}
+    tmp = WORK or tempfile.gettempdir()
+    tid = threading.get_ident()
+    hdr = os.path.join(tmp, f'geocheck-h-{tid}.txt')
+    body_f = os.path.join(tmp, f'geocheck-b-{tid}.txt')
     fmt = r'\n%{http_code}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{time_total}|%{remote_ip}'
-    cmd = [CURL, '-sS', '-4', '--ssl-no-revoke',  # Schannel: иначе CRYPT_E_REVOCATION_OFFLINE на этой машине
-           '-o', body_f if capture_body else os.devnull, '-D', hdr, '-w', fmt,
-           '--max-time', '60', '--connect-timeout', '20', '-A', UA]
+    cmd = [curl, '-sS', '-4']
+    if os.name == 'nt':
+        cmd.append('--ssl-no-revoke')   # Schannel: иначе CRYPT_E_REVOCATION_OFFLINE
+    cmd += ['-o', body_f if capture_body else os.devnull, '-D', hdr, '-w', fmt,
+            '--max-time', '60', '--connect-timeout', '20', '-A', UA]
     if port:
         cmd += ['-x', f'socks5h://127.0.0.1:{port}']
     cmd += ['--', url]
@@ -310,22 +218,9 @@ def probe(url, port=None, capture_body=False):
             pass
         if not code:
             err = (p.stderr or '').strip()
-            low = err.lower()
-            rc = p.returncode
-            if rc == 28 and 'connection timed out' in low:
-                res['note'] = 'нет ответа: соединение не установлено за 20с — сервер/фаервол роняет пакеты'
-            elif rc == 28:
-                res['note'] = 'сервер отвечал дольше 60с — обрыв по потолку ожидания'
-            elif rc == 97 or 'socks5' in low:
-                res['note'] = 'туннель не поднялся — ядро sing-box или сервер VPN недоступны'
-            elif rc in (35, 51, 58, 60):
-                res['note'] = 'ошибка TLS-рукопожатия — режут на пути (DPI/фаервол) или сертификат'
-            elif rc == 6:
-                res['note'] = 'домен не резолвится'
-            elif rc in (7, 52, 56):
-                res['note'] = 'соединение сброшено/отказано'
-            else:
-                res['note'] = f'обрыв/таймаут (curl {rc})'
+            kind = classify_curl_error(p.returncode, err)
+            res['errorKind'] = kind
+            res['note'] = curl_note(kind, p.returncode)
             res['error'] = err[:400]
         if capture_body:
             try:
@@ -334,7 +229,7 @@ def probe(url, port=None, capture_body=False):
                 res['body'] = ''
         return res
     except Exception as e:
-        return {'code': 0, 'note': 'ошибка демона', 'error': str(e)[:400]}
+        return {'code': 0, 'note': 'ошибка демона', 'errorKind': 'other', 'error': str(e)[:400]}
     finally:
         for f in (hdr, body_f) if capture_body else (hdr,):
             try:
@@ -344,6 +239,11 @@ def probe(url, port=None, capture_body=False):
 
 
 # ---------------------------------------------------------------- lifecycle
+def _new_exit(eid, label, port, status):
+    return {'id': eid, 'label': label, 'port': port, 'status': status, 'claimed': claimed_country(label),
+            'fails': 0, 'excluded': False, 'exit_ip': '', 'exit_loc': '', 'geo': 'unknown'}
+
+
 def configure(urls, inline=None):
     warnings = []
     with STATE['lock']:
@@ -352,9 +252,12 @@ def configure(urls, inline=None):
         STATE['exits'] = []
         STATE['subs_urls'] = list(urls)
         sb, sb_mode = find_singbox()
+        env_sb = os.environ.get('SINGBOX_PATH', '').strip()
+        if env_sb and not os.path.exists(env_sb):
+            warnings.append('SINGBOX_PATH задан, но файла нет')
         if not sb:
-            warnings.append('sing-box не найден — задайте SINGBOX_PATH. Локальных выходов нет, '
-                            'работает только системный маршрут.')
+            warnings.append('sing-box не найден — задайте SINGBOX_PATH или положите в PATH. '
+                            'Локальных выходов нет, работает только системный канал.')
         texts = list(inline or [])
         for u in urls:
             try:
@@ -368,8 +271,8 @@ def configure(urls, inline=None):
             proxies.extend(parse_subscription(t))
         if not proxies and texts:
             warnings.append('подписка скачалась, но конфиги не распознаны')
-        STATE['exits'].append({'id': 'direct', 'label': 'Этот ПК (системный канал)',
-                               'port': None, 'status': 'через текущий VPN/провайдера'})
+        STATE['exits'].append(_new_exit('direct', 'Этот ПК (системный канал)', None,
+                                        'через текущий VPN/провайдера'))
         STATE['sb'] = sb
         STATE['sb_mode'] = sb_mode
         if len(proxies) > MAX_EXITS:
@@ -381,45 +284,32 @@ def configure(urls, inline=None):
             if host and not re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
                 ip = resolve_ipv4(host)
                 if ip:
-                    p['server'] = ip  # TLS SNI/Host берутся из server_name/transport отдельно
+                    p['server'] = ip
                 else:
                     warnings.append(f'{label}: не удалось резолвить сервер вне tun-DNS')
-            ex = {'id': f'px{i}', 'label': label, 'port': port, 'status': 'запускается…'}
+            ex = _new_exit(f'px{i}', label, port, 'запускается…')
             STATE['exits'].append(ex)
             if sb:
                 cfg, _ = sb_config(p, port)
                 cfg_path = os.path.join(WORK, f'sb-{port}.json')
                 with open(cfg_path, 'w', encoding='utf-8') as f:
                     json.dump(cfg, f)
-                try:
-                    proc = subprocess.Popen([sb, sb_mode, '-c', cfg_path],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                            cwd=WORK)
-                    ex['proc'] = proc
-                    ex['cfg'] = cfg_path
-                    time.sleep(0.4)
-                    if proc.poll() is not None:
-                        ex['status'] = 'ядро не запустилось (см. конфиг)'
-                        warnings.append(f'{label}: sing-box упал сразу после старта')
-                    else:
-                        ex['status'] = f'127.0.0.1:{port}'
-                except Exception as e:
-                    ex['status'] = 'ошибка запуска'
-                    warnings.append(f'{label}: {e}')
+                ex['cfg'] = cfg_path
+                if not start_core(ex):
+                    warnings.append(f'{label}: sing-box не запустился')
             else:
                 ex['status'] = 'нет sing-box'
+        STATE['warnings'] = warnings
     return {'exits': public_exits(), 'warnings': warnings}
 
 
 def start_core(ex):
-    """Запустить sing-box-ядро выхода (используется при конфигурации и авто-рестарте)."""
     sb, sb_mode = STATE.get('sb'), STATE.get('sb_mode')
     if not sb or not ex.get('cfg'):
         return False
     try:
         proc = subprocess.Popen([sb, sb_mode, '-c', ex['cfg']],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                cwd=WORK)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=WORK)
         ex['proc'] = proc
         time.sleep(0.4)
         if proc.poll() is not None:
@@ -441,7 +331,7 @@ def ensure_cores():
                 continue
             p = ex.get('proc')
             if p is not None and p.poll() is None:
-                continue  # живо
+                continue
             if start_core(ex):
                 restarted += 1
     if restarted:
@@ -467,102 +357,259 @@ def kill_exit(ex):
 
 
 def public_exits():
-    return [{'id': e['id'], 'label': e['label'], 'port': e['port'], 'status': e['status'],
-             'exit_ip': e.get('exit_ip', ''), 'exit_loc': e.get('exit_loc', '')}
-            for e in STATE['exits']]
+    keys = ('id', 'label', 'port', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded')
+    return [{k: e.get(k) for k in keys} for e in STATE['exits']]
 
 
-def browser_probe(url, port):
-    """Проверка настоящим браузером (daemon/browser_probe.py): антибот-заглушка со Send, время загрузки."""
-    if not re.match(r'^https?://\S+$', url or '', re.I):
-        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)'}
-    try:
-        p = subprocess.run([sys.executable, '-I', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'browser_probe.py'),
-                            url, str(port or '')], capture_output=True, text=True, timeout=150)
-        return json.loads((p.stdout or '').strip().splitlines()[-1])
-    except Exception as e:
-        return {'code': 0, 'note': 'браузерный пробник не ответил', 'error': str(e)[:300]}
+def reset_exits():
+    with STATE['lock']:
+        for ex in STATE['exits']:
+            ex['fails'] = 0
+            ex['excluded'] = False
+    return public_exits()
 
 
-def run_checks(domains, browser=False, domain_first=False):
-    ensure_cores()   # поднять ядра, которые умерли между прогонами
-    exits = list(STATE['exits'])
-    jobs = [(ex, d) for ex in exits for d in domains]
-    results = {e['id']: {} for e in exits}
-    with ThreadPoolExecutor(max_workers=4 if browser else 16) as pool:
-        fn = browser_probe if browser else probe
-
-        def job(ex, d):
-            if domain_first:
-                root = re.match(r'^(https?://[^/]+)', d)
-                root = root.group(1) + '/' if root else ''
-                if root and root != d:
-                    rr = fn(root, ex['port'])
-                    if not rr.get('code') and not rr.get('hardBlock'):
-                        return {'code': 0, 'note': 'домен не грузится — страница не проверялась: ' + (rr.get('note') or ''),
-                                'rootCode': 0, 'rootMs': rr.get('ms'), 'skipped': True}
-                    res = fn(d, ex['port'])
-                    res['rootCode'], res['rootMs'] = rr.get('code'), rr.get('ms')
-                    return res
-            return fn(d, ex['port'])
-        futs = {pool.submit(job, ex, d): (ex, d) for ex, d in jobs}
-        for fut, (ex, d) in futs.items():
-            results[ex['id']][d] = fut.result()
-    return results
-
-
-TRACE_URL = 'https://www.cloudflare.com/cdn-cgi/trace'
+# ---------------------------------------------------------------- control probe + GeoIP
+def control_check(ex):
+    """Контрольный сайт через выход: жив ли выход и какая страна у его IP. Меняет счётчик отказов."""
+    r = probe(CONTROL_URL, ex['port'], capture_body=True)
+    ok = 200 <= (r.get('code') or 0) < 400
+    ip = loc = ''
+    for line in (r.get('body') or '').splitlines():
+        if line.startswith('ip='):
+            ip = line[3:]
+        elif line.startswith('loc='):
+            loc = line[4:]
+    if ok:
+        ex['fails'] = 0
+        ex['exit_ip'], ex['exit_loc'] = ip or ex.get('exit_ip', ''), loc
+    else:
+        ex['fails'] = ex.get('fails', 0) + 1
+        if ex['fails'] >= EXCLUDE_AFTER:
+            ex['excluded'] = True
+    ex['ok'] = ok
+    ex['geo'] = geo_verdict(ex.get('claimed', ''), loc if ok else '')
+    return {'code': r.get('code', 0), 'ms': r.get('ms'), 'ip': ip, 'loc': loc, 'ok': ok,
+            'error': (r.get('error') or r.get('note') or '')[:200] if not ok else '',
+            'fails': ex['fails'], 'excluded': ex['excluded'], 'geo': ex['geo']}
 
 
 def warmup():
-    """Прогрев: пингануть каждый выход, для живых показать exit-IP/страну."""
+    """Прогрев: контрольная проверка каждого живого выхода; отдаёт exit-IP и страну."""
     ensure_cores()
-    def job(ex):
-        if ex['port'] is None:
-            r = probe(TRACE_URL, None, capture_body=True)
-        else:
-            r = probe(TRACE_URL, ex['port'], capture_body=True)
-        out = {'code': r['code'], 'ms': r.get('ms')}
-        if not r['code']:
-            out['error'] = (r.get('error') or r.get('note') or '')[:200]
-        for line in (r.get('body') or '').splitlines():
-            if line.startswith('ip='):
-                out['ip'] = line[3:]
-            elif line.startswith('loc='):
-                out['loc'] = line[4:]
-        # запоминаем exit-IP на самом выходе — /status отдаст его дашборду
-        if out.get('ip'):
-            ex['exit_ip'] = out['ip']
-            ex['exit_loc'] = out.get('loc', '')
-        return out
-    res = {}
+    with STATE['lock']:
+        exits = [e for e in STATE['exits'] if not e.get('excluded')]
     with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = {pool.submit(job, ex): ex for ex in list(STATE['exits'])}
-        for fut, ex in futs.items():
-            res[ex['id']] = fut.result()
-    return res
+        futs = {ex['id']: pool.submit(control_check, ex) for ex in exits}
+        return {eid: f.result() for eid, f in futs.items()}
 
 
-def shutdown_cores():
-    for ex in list(STATE['exits']):
-        kill_exit(ex)
-    shutil.rmtree(WORK, ignore_errors=True)
+# ---------------------------------------------------------------- measurement
+def browser_probe(url, port):
+    """Проверка настоящим браузером (daemon/browser_probe.py): антибот-заглушка со Send, время загрузки."""
+    if not re.match(r'^https?://\S+$', url or '', re.I):
+        return {'code': 0, 'note': 'недопустимый URL (нужен http/https)', 'errorKind': 'other'}
+    try:
+        p = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'browser_probe.py'), url, str(port or '')],
+                           capture_output=True, text=True, timeout=150)
+        return json.loads((p.stdout or '').strip().splitlines()[-1])
+    except Exception as e:
+        return {'code': 0, 'note': 'браузерный пробник не ответил', 'errorKind': 'other', 'error': str(e)[:300]}
 
 
-atexit.register(shutdown_cores)
+def _one_probe(ex, target, browser, domain_first):
+    fn = browser_probe if browser else probe
+    if domain_first:
+        root = root_of(target)
+        if root != target:
+            rr = fn(root, ex['port'])
+            if not rr.get('code') and not rr.get('hardBlock'):
+                return {'code': 0, 'note': 'домен не грузится — страница не проверялась: ' + (rr.get('note') or ''),
+                        'rootCode': 0, 'rootMs': rr.get('ms'), 'skipped': True}
+            res = fn(target, ex['port'])
+            res['rootCode'], res['rootMs'] = rr.get('code'), rr.get('ms')
+            return res
+    return fn(target, ex['port'])
+
+
+def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms):
+    """Один выход × одна цель: несколько повторов, большинство побеждает."""
+    if job.cancelled.is_set():
+        return
+    statuses, reps = [], []
+    for _ in range(repeats):
+        if job.cancelled.is_set():
+            return
+        res = _one_probe(ex, target, browser, domain_first)
+        statuses.append(cell_status(res, slow_ms if browser else None))
+        reps.append(res)
+    winner, stable = majority(statuses)
+    cell = dict(next(r for r, s in zip(reps, statuses) if s == winner))
+    cell['status'] = winner
+    cell['repeats'] = statuses
+    cell['stable'] = stable
+    cell.pop('body', None)
+    if winner == 'fail':
+        cell['symptom'] = symptom(cell)
+    if ex.get('geo') == 'mismatch' and winner in ('ok', 'fail'):
+        cell['rawStatus'] = winner
+        cell['status'] = 'geo_mismatch'
+    job.record(ex['id'], target, cell)
+
+
+def run_job(job):
+    """Раннер прогона (вызывается из рабочего потока JobManager)."""
+    p = job.params
+    browser = bool(p.get('browser'))
+    domain_first = bool(p.get('domainFirst'))
+    default_rep = 1 if browser else REPEATS_DEFAULT
+    try:
+        repeats = max(1, min(3, int(p.get('repeats') or default_rep)))
+    except (TypeError, ValueError):
+        repeats = default_rep
+    try:
+        slow_ms = max(1000, int(p.get('slowMs') or SLOW_MS_DEFAULT))
+    except (TypeError, ValueError):
+        slow_ms = SLOW_MS_DEFAULT
+    ensure_cores()
+    with STATE['lock']:
+        exits = list(STATE['exits'])
+    targets = list(job.targets)
+    job.total = len(exits) * len(targets)
+    job.warnings.extend(STATE.get('warnings', [])[:5])
+
+    # 1) контрольная проверка выходов (исключённые пропускаем)
+    to_check = [ex for ex in exits if not ex.get('excluded') and ex.get('port') is not None]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(control_check, to_check))
+    if job.cancelled.is_set():
+        return
+    for ex in exits:
+        if ex.get('port') is None:
+            ex['ok'] = True          # системный канал не проверяем контрольно — его замеры идут как есть
+    job.exits = public_exits()
+    job.exit_labels = {ex['id']: ex['label'] for ex in exits}
+
+    # 2) замеры
+    workers = 4 if browser else 16
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for ex in exits:
+            for t in targets:
+                if ex.get('excluded'):
+                    job.record(ex['id'], t, {'code': 0, 'status': 'excluded',
+                                             'note': f'выход исключён: {EXCLUDE_AFTER} проверок подряд не прошли'})
+                elif ex.get('ok') is False:
+                    job.record(ex['id'], t, {'code': 0, 'exitDown': True, 'status': 'exit_down',
+                                             'note': 'выход не прошёл контрольную проверку — замер не учитывается'})
+                else:
+                    pool.submit(measure_cell, job, ex, t, browser, domain_first, repeats, slow_ms)
+    # ждём пул (выход из with ждёт завершения задач)
+
+    # 3) итог по целям
+    summary = {}
+    for t in targets:
+        statuses, results = [], []
+        for ex in exits:
+            cell = job.results.get(ex['id'], {}).get(t)
+            statuses.append(cell.get('status', 'skipped') if cell else 'skipped')
+            results.append(cell or {})
+        summary[t] = site_verdict(statuses, results)
+    job.summary = summary
+
+
+def _targets(raw):
+    targets, bad = [], 0
+    for r in list(raw or [])[:MAX_TARGETS]:
+        t = normalize_target(r) if isinstance(r, str) else None
+        if t is None:
+            bad += 1
+        elif t not in targets:
+            targets.append(t)
+    return targets, bad
 
 
 # ---------------------------------------------------------------- HTTP
 FWD_HOSTS = ('check-host.net', 'api.globalping.io')
+CTYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+          '.css': 'text/css; charset=utf-8'}
 
 
 class H(BaseHTTPRequestHandler):
+    server_version = 'GeoCheck'
+
     def log_message(self, *a):
         pass
 
+    # --- guards
+    def _auth_ok(self):
+        got = self.headers.get('Authorization', '') or ''
+        if got.lower().startswith('bearer '):
+            got = got[7:]
+        else:
+            got = self.headers.get('X-GeoCheck-Token', '') or ''
+        return hmac.compare_digest(got.strip().encode(), TOKEN.encode())
+
+    def _guard(self, api=True):
+        """Токен задан → API требует токен, Origin — из списка или тот же хост.
+        Токена нет → только loopback (защита от DNS-rebinding и чужих сайтов)."""
+        host_hdr = (self.headers.get('Host') or '').strip().lower()
+        hostname = host_hdr[1:].split(']')[0] if host_hdr.startswith('[') else host_hdr.split(':')[0]
+        origin = (self.headers.get('Origin') or '').rstrip('/')
+        if TOKEN:
+            if api and not self._auth_ok():
+                self._json({'ok': False, 'error': 'unauthorized'}, 401)
+                return False
+            same = origin.lower() in (f'http://{host_hdr}', f'https://{host_hdr}')
+            if origin and origin not in ALLOWED_ORIGINS and not same:
+                self._json({'ok': False, 'error': 'forbidden (origin)'}, 403)
+                return False
+            return True
+        if hostname not in LOOPBACK or (origin and origin not in ALLOWED_ORIGINS):
+            self._json({'ok': False, 'error': 'forbidden (origin/host)'}, 403)
+            return False
+        return True
+
+    def _cors(self):
+        origin = (self.headers.get('Origin') or '').rstrip('/')
+        self.send_header('Access-Control-Allow-Origin', origin if origin in ALLOWED_ORIGINS else 'null')
+        self.send_header('Vary', 'Origin')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-GeoCheck-Token')
+        self.send_header('Access-Control-Allow-Private-Network', 'true')
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self._cors()
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _static(self, path):
+        name = 'index.html' if path in ('', '/') else path.lstrip('/')
+        if name not in STATIC_FILES:
+            return self._json({'ok': False, 'error': 'unknown'}, 404)
+        try:
+            with open(os.path.join(ROOT, name), 'rb') as f:
+                data = f.read()
+        except OSError:
+            return self._json({'ok': False, 'error': 'unknown'}, 404)
+        self.send_response(200)
+        self.send_header('Content-Type', CTYPES.get(os.path.splitext(name)[1], 'application/octet-stream'))
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        n = int(self.headers.get('Content-Length', '0') or 0)
+        if n > MAX_BODY:
+            raise ValueError('too large')
+        return json.loads(self.rfile.read(n) or b'{}')
+
+    # --- forwarder (check-host / GlobalPing, обход блокировок в браузере)
     def fwd_request(self, method):
-        """Узкий форвардер для внешних API проверки доступности (обход блокировок
-        в браузере). Разрешены только хосты из FWD_HOSTS, схема — только https."""
         from urllib.parse import urlparse, parse_qs, unquote
         qs = parse_qs(urlparse(self.path).query)
         u = unquote(qs.get('url', [''])[0])
@@ -572,6 +619,8 @@ class H(BaseHTTPRequestHandler):
         body = None
         if method == 'POST':
             n = int(self.headers.get('Content-Length', '0') or 0)
+            if n > MAX_BODY:
+                return self._json({'ok': False, 'error': 'too large'}, 413)
             body = self.rfile.read(n) if n else None
         req = urllib.request.Request(u, data=body, method=method, headers={
             'User-Agent': UA, 'Accept': 'application/json',
@@ -594,81 +643,105 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _guard(self):
-        """Защита от DNS-rebinding и чужих сайтов: Host — только loopback, Origin — из белого списка."""
-        host = (self.headers.get('Host') or '').rsplit(':', 1)[0].strip('[]').lower()
-        origin = (self.headers.get('Origin') or '').rstrip('/')
-        if host not in ('127.0.0.1', 'localhost') or (origin and origin not in ALLOWED_ORIGINS):
-            self._json({'ok': False, 'error': 'forbidden (origin/host)'}, 403)
-            return False
-        return True
-
-    def _cors(self):
-        origin = (self.headers.get('Origin') or '').rstrip('/')
-        self.send_header('Access-Control-Allow-Origin', origin if origin in ALLOWED_ORIGINS else 'null')
-        self.send_header('Vary', 'Origin')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-        self.send_header('Access-Control-Allow-Private-Network', 'true')
-
-    def _json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self._cors()
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
+    # --- verbs
     def do_OPTIONS(self):
-        if not self._guard():
+        if not self._guard(api=False):
             return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        path = self.path.split('?', 1)[0]
+        if path in ('/', '') or path.lstrip('/') in STATIC_FILES:
+            if not self._guard(api=False):
+                return
+            return self._static(path)
         if not self._guard():
             return
-        if self.path.startswith('/fwd'):
+        if path.startswith('/fwd'):
             return self.fwd_request('GET')
-        if self.path.startswith('/warmup'):
-            self._json({'ok': True, 'results': warmup()})
-        elif self.path.startswith('/status'):
-            self._json({'ok': True, 'version': '1.0', 'exits': public_exits()})
-        else:
-            self._json({'ok': False, 'error': 'unknown'}, 404)
+        if path == '/status':
+            return self._json({'ok': True, 'version': VERSION, 'exits': public_exits(),
+                               'auth': 'token' if TOKEN else 'loopback'})
+        if path == '/warmup':
+            return self._json({'ok': True, 'results': warmup()})
+        if path == '/jobs':
+            return self._json({'ok': True, 'jobs': JOBS.list()})
+        if path.startswith('/jobs/'):
+            job = JOBS.get(path[6:].strip('/'))
+            if not job:
+                return self._json({'ok': False, 'error': 'нет такого задания'}, 404)
+            return self._json({'ok': True, 'job': job.snapshot(full=True)})
+        if path == '/history':
+            return self._json({'ok': True, 'runs': HISTORY.list_runs()})
+        if path.startswith('/history/'):
+            run = HISTORY.get_run(path[9:].strip('/'))
+            if not run:
+                return self._json({'ok': False, 'error': 'нет такого прогона'}, 404)
+            return self._json({'ok': True, 'run': run})
+        return self._json({'ok': False, 'error': 'unknown'}, 404)
 
     def do_POST(self):
+        path = self.path.split('?', 1)[0]
         if not self._guard():
             return
-        if self.path.startswith('/fwd'):
+        if path.startswith('/fwd'):
             return self.fwd_request('POST')
         try:
-            n = int(self.headers.get('Content-Length', '0'))
-            body = json.loads(self.rfile.read(n) or b'{}')
+            body = self._body()
+        except ValueError as e:
+            code = 413 if str(e) == 'too large' else 400
+            return self._json({'ok': False, 'error': 'слишком большой запрос' if code == 413 else 'bad json'}, code)
         except Exception:
             return self._json({'ok': False, 'error': 'bad json'}, 400)
-        if self.path.startswith('/set_subscriptions'):
+
+        if path == '/set_subscriptions':
             urls = [u for u in body.get('urls', []) if isinstance(u, str) and u.startswith(('http://', 'https://'))]
-            # inline: пользователь вставил список ссылок (vless://...) напрямую — секрет не уходит с машины
             inline = [t for t in body.get('inline', []) if isinstance(t, str) and t.strip()]
             if not urls and not inline:
                 return self._json({'ok': False, 'error': 'пустой список URL'}, 400)
             r = configure(urls, inline)
-            self._json({'ok': True, 'exits': r['exits'], 'warnings': r['warnings']})
-        elif self.path.startswith('/run'):
-            domains = [d for d in body.get('domains', []) if isinstance(d, str)]
-            if not domains:
-                return self._json({'ok': False, 'error': 'нет доменов'}, 400)
-            self._json({'ok': True, 'results': run_checks(domains, bool(body.get('browser')), bool(body.get('domainFirst')))})
-        else:
-            self._json({'ok': False, 'error': 'unknown'}, 404)
+            return self._json({'ok': True, 'exits': r['exits'], 'warnings': r['warnings']})
+
+        if path == '/exits/reset':
+            return self._json({'ok': True, 'exits': reset_exits()})
+
+        if path == '/run':   # совместимость: синхронный прогон
+            targets, bad = _targets(body.get('domains') or body.get('targets'))
+            if not targets:
+                return self._json({'ok': False, 'error': 'нет доменов или страниц'}, 400)
+            job = JOBS.create(targets, _params(body))
+            JOBS.wait(job)
+            snap = job.snapshot(full=True)
+            return self._json({'ok': True, 'id': job.id, 'results': snap['results'],
+                               'summary': snap['summary'], 'exits': snap['exits'],
+                               'warnings': snap['warnings'] + ([f'{bad} целей отброшено (не похожи на URL)'] if bad else []),
+                               'status': snap['status']})
+
+        if path == '/jobs':
+            targets, bad = _targets(body.get('targets') or body.get('domains'))
+            if not targets:
+                return self._json({'ok': False, 'error': 'нет доменов или страниц'}, 400)
+            job = JOBS.create(targets, _params(body))
+            return self._json({'ok': True, 'id': job.id, 'status': job.status,
+                               'skipped': bad, 'total': len(targets)})
+
+        if path.startswith('/jobs/') and path.endswith('/cancel'):
+            jid = path[6:-7].strip('/')
+            return self._json({'ok': JOBS.cancel(jid)}, 200 if JOBS.get(jid) else 404)
+
+        return self._json({'ok': False, 'error': 'unknown'}, 404)
 
 
+def _params(body):
+    return {'browser': bool(body.get('browser')), 'domainFirst': bool(body.get('domainFirst')),
+            'repeats': body.get('repeats'), 'slowMs': body.get('slowMs')}
+
+
+# ---------------------------------------------------------------- startup
 def load_local_files():
-    """subs.txt (URL подписок и/или vless://-ссылки) и user_nodes.txt (ссылки) рядом с проектом.
-    Файлы читает только демон; содержимое не выводится в логи."""
+    """subs.txt и user_nodes.txt рядом с проектом. Файлы читает только демон; содержимое не выводится."""
     urls, inline = [], []
     for name in ('subs.txt', 'user_nodes.txt'):
         path = os.path.join(ROOT, name)
@@ -682,12 +755,29 @@ def load_local_files():
     return urls, (['\n'.join(inline)] if inline else [])
 
 
+def shutdown_cores():
+    for ex in list(STATE['exits']):
+        kill_exit(ex)
+    if WORK:
+        shutil.rmtree(WORK, ignore_errors=True)
+
+
+atexit.register(shutdown_cores)
+
+
 def main():
-    if not CURL:
-        raise SystemExit('curl.exe не найден в PATH')
+    global WORK, JOBS, HISTORY
+    if not curl_bin():
+        raise SystemExit('curl не найден в PATH')
+    if BIND not in LOOPBACK and not TOKEN:
+        raise SystemExit(f'RG_BIND={BIND} — не loopback: задайте RG_TOKEN (без токена демон слушает только 127.0.0.1)')
+    WORK = tempfile.mkdtemp(prefix='geocheck-')   # приватная папка: конфиги ядер содержат учётные данные
+    os.makedirs(DATA_DIR, exist_ok=True)
+    HISTORY = History(os.path.join(DATA_DIR, 'history.db'))
+    JOBS = JobManager(run_job, HISTORY)
     if not STATE['exits']:
-        STATE['exits'].append({'id': 'direct', 'label': 'Этот ПК (системный канал)',
-                               'port': None, 'status': 'через текущий VPN/провайдера'})
+        STATE['exits'].append(_new_exit('direct', 'Этот ПК (системный канал)', None,
+                                        'через текущий VPN/провайдера'))
     urls, inline = load_local_files()
     urls = STATE['subs_urls'] + [u for u in urls if u not in STATE['subs_urls']]
     if urls or inline:
@@ -695,8 +785,9 @@ def main():
         print('Подписки загружены · выходов:', len(r['exits']))
         for w in r['warnings']:
             print('WARN:', w)
-    print(f'GeoCheck daemon: http://127.0.0.1:{PORT}  (только локально, секреты не сохраняются)')
-    ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
+    mode = 'с токеном' if TOKEN else 'только loopback, без токена'
+    print(f'GeoCheck daemon {VERSION}: http://{BIND}:{PORT}  ({mode}; секреты не сохраняются)', flush=True)
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
 
 
 if __name__ == '__main__':
