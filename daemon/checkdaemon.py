@@ -673,6 +673,17 @@ def activity_get():
             a = dict(ACTIVITY)
             a['elapsed'] = int(time.time() - a['since'])
             return a
+    # страницу обновили/закрыли, а задание на сервере ещё идёт — показываем его
+    try:
+        for j in (JOBS.list(10) if JOBS else []):
+            if j.get('status') in ('running', 'queued'):
+                pr = j.get('progress') or {}
+                t0 = j.get('started') or j.get('created') or time.time()
+                return {'id': 'job', 'label': 'проверка на сервере', 'since': t0, 'updated': time.time(),
+                        'text': f"демон: {pr.get('done', 0)}/{pr.get('total', 0)} замеров",
+                        'elapsed': int(time.time() - t0)}
+    except Exception:
+        pass
     return None
 
 

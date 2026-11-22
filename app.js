@@ -703,7 +703,26 @@ function saveLastRun(model) {
   dFetch('/lastmodel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: clean }) }).catch(() => { });
 }
 /* общий статус: если проверку запустили на другом устройстве — показываем это здесь */
-let remoteWas = false;
+let remoteWas = false, remoteBusy = false;
+const LOCK_BTNS = ['btnRun', 'btnRecheckFailed', 'btnRecheckNon200', 'btnRecheckGrey', 'btnWarmup'];
+/* пока что-то уже проверяется (здесь или на другом устройстве) — повторно не запускаем */
+function busyBlock() {
+  if (remoteBusy || actBeat) {
+    const m = remoteBusy ? 'проверка уже идёт на другом устройстве — дождитесь окончания' : 'проверка уже идёт — дождитесь окончания';
+    log('⛔ ' + m, 'warn');
+    return true;
+  }
+  return false;
+}
+function lockButtons() {
+  const on = remoteBusy;
+  for (const id of LOCK_BTNS) {
+    const b = document.getElementById(id);
+    if (!b) continue;
+    if (on) { b.dataset.lockedRemote = '1'; b.disabled = true; }
+    else if (b.dataset.lockedRemote) { delete b.dataset.lockedRemote; b.disabled = false; }
+  }
+}
 async function watchActivity() {
   try {
     const r = await dFetch('/activity', { signal: AbortSignal.timeout(5000) });
@@ -716,9 +735,12 @@ async function watchActivity() {
     }
     if (remoteWas && !other && !actBeat) setTimeout(restoreServerRun, 2500);   // чужой прогон закончился — подтянем результат
     remoteWas = !!other;
+    remoteBusy = !!other;
+    lockButtons();
   } catch { }
 }
 setInterval(watchActivity, 3000);
+watchActivity();   // сразу при загрузке: после обновления страницы статус виден без задержки
 async function restoreServerRun() {
   try {
     const r = await dFetch('/lastmodel');
@@ -1115,7 +1137,7 @@ function finalize(model, seq, tRun, full = false) {
   if (histViewAt) closeHistView(); else renderRows(model);
 }
 
-async function runAll() { paceRun('прогон', runAllNow); }
+async function runAll() { if (busyBlock()) return; paceRun('прогон', runAllNow); }
 async function runAllNow() {
   if (!settings.domains.length) { alert('Добавьте хотя бы один домен.'); return; }
   const seq = ++runSeq;
@@ -1172,6 +1194,7 @@ async function runAllNow() {
 }
 
 async function reCheckSource(id) {
+  if (busyBlock()) return;
   if (!lastModel) { alert('Сначала запустите полную проверку — источнику нужны строки для обновления.'); return; }
   const seq = ++runSeq;
   const tRun = Date.now();
@@ -1195,6 +1218,7 @@ async function reCheckSource(id) {
 
 /* универсальный перезапуск набора точек */
 async function recheckKeys(keys, label) {
+  if (busyBlock()) return;
   if (!lastModel || !keys.size) return;
   const diList = activeDomainIdxs();
   if (!diList.length) { alert('Отметьте хотя бы один домен.'); return; }
@@ -1269,6 +1293,7 @@ async function reCheckRow(key) {
 
 /* одна ячейка (точка × домен) */
 async function reCheckCell(key, di) {
+  if (busyBlock()) return;
   if (!lastModel) return;
   const r = getRow(lastModel, key);
   if (!r || r.isMsg) return;
@@ -1290,6 +1315,7 @@ async function reCheckCell(key, di) {
 
 /* ---------------- прогрев VPN (пинг всех выходов) ---------------- */
 async function warmupLocal() {
+  if (busyBlock()) return;
   const j = await daemonPing();
   if (!j || !j.ok) { log('прогрев: демон не отвечает', 'err'); setAction('прогрев невозможен — демон не отвечает'); return; }
   const btn = document.getElementById('btnWarmup');
