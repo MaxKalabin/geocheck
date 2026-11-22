@@ -513,6 +513,14 @@ def _one_probe(ex, target, browser, domain_first):
     return fn(target, ex['port'])
 
 
+def _stamp(cell, ex):
+    """В замер пишем время и IP/страну VPN-выхода на этот момент — для истории ошибок."""
+    cell['at'] = round(time.time(), 1)
+    cell['exitIp'] = ex.get('exit_ip') or ''
+    cell['exitLoc'] = ex.get('exit_loc') or ''
+    return cell
+
+
 def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms):
     """Один выход × одна цель: несколько повторов, большинство побеждает."""
     if job.cancelled.is_set():
@@ -535,7 +543,7 @@ def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms):
     if ex.get('geo') == 'mismatch' and winner in ('ok', 'fail'):
         cell['rawStatus'] = winner
         cell['status'] = 'geo_mismatch'
-    job.record(ex['id'], target, cell)
+    job.record(ex['id'], target, _stamp(cell, ex))
 
 
 def run_job(job):
@@ -579,11 +587,11 @@ def run_job(job):
         for ex in exits:
             for t in targets:
                 if ex.get('excluded'):
-                    job.record(ex['id'], t, {'code': 0, 'status': 'excluded',
-                                             'note': f'выход исключён: {EXCLUDE_AFTER} проверок подряд не прошли'})
+                    job.record(ex['id'], t, _stamp({'code': 0, 'status': 'excluded',
+                                             'note': f'выход исключён: {EXCLUDE_AFTER} проверок подряд не прошли'}, ex))
                 elif ex.get('ok') is False:
-                    job.record(ex['id'], t, {'code': 0, 'exitDown': True, 'status': 'exit_down',
-                                             'note': 'выход не прошёл контрольную проверку — замер не учитывается'})
+                    job.record(ex['id'], t, _stamp({'code': 0, 'exitDown': True, 'status': 'exit_down',
+                                             'note': 'выход не прошёл контрольную проверку — замер не учитывается'}, ex))
                 else:
                     pool.submit(measure_cell, job, ex, t, browser, domain_first, repeats, slow_ms)
     # ждём пул (выход из with ждёт завершения задач)
@@ -637,7 +645,7 @@ def scrub_model(m):
                 r['sub'] = re.sub(r'exit [0-9a-fA-F.:]+ \(', '(', r['sub'])
             for c in (r.get('cells') or {}).values():
                 if isinstance(c, dict):
-                    for k in ('error', 'headers', 'body'):
+                    for k in ('error', 'headers', 'body', 'exitIp', 'exitLoc'):
                         c.pop(k, None)
     return m
 
@@ -910,6 +918,8 @@ class H(BaseHTTPRequestHandler):
             return self._json({'ok': True, 'activity': activity_get()})
         if path == '/stats':
             return self._json({'ok': True, **HISTORY.stats(_days(self.path))})
+        if path == '/errors':
+            return self._json({'ok': True, 'errors': HISTORY.errors(_days(self.path))})
         if path == '/history':
             return self._json({'ok': True, 'runs': HISTORY.list_runs()})
         if path.startswith('/history/'):

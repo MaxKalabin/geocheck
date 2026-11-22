@@ -68,6 +68,17 @@ async function load() {
     if (!DATA.ok) throw new Error(DATA.error || r.status);
   } catch (e) { document.getElementById('meta').textContent = 'не удалось загрузить: ' + (e.message || e); return; }
   render();
+  if (!PUBLIC) loadErrors(days);
+}
+const KIND = { nginx: '🛑 NGINX 503', unreachable: '⛔ недоступна', exit_down: 'выход не отвечал', http: 'ошибка HTTP' };
+async function loadErrors(days) {
+  const el = document.getElementById('tErrors');
+  try {
+    const j = await (await dFetch('/errors' + (days ? '?days=' + days : ''))).json();
+    const rows = (j.errors || []).map(e => `<tr><td>${when(e.at)}</td><td>${esc(short(e.target))}</td><td>${esc(e.exit)}</td><td>${esc(e.exitIp || '—')}${e.exitLoc ? ' · ' + esc(e.exitLoc) : ''}</td><td>${KIND[e.kind] || e.kind}${e.code ? ' ' + e.code : ''}</td><td>${esc(e.note)}</td></tr>`).join('');
+    el.innerHTML = '<tr><th>Время</th><th>Ресурс</th><th>Выход</th><th>IP выхода · страна</th><th>Что случилось</th><th>Причина</th></tr>' +
+      (rows || '<tr><td colspan="6">ошибок нет</td></tr>');
+  } catch (e) { el.innerHTML = '<tr><td>не удалось загрузить журнал</td></tr>'; }
 }
 document.getElementById('days').onchange = load;
 (async () => {

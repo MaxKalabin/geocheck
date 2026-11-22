@@ -172,6 +172,32 @@ class History:
                                   key=lambda x: x['target']),
                 'matrix': [{'target': t, 'exit': e, **fin(v)} for (t, e), v in mx.items()]}
 
+    def errors(self, days=None, limit=500):
+        """Журнал сбоев: время, ресурс, выход, IP и страна выхода, причина (новые сверху)."""
+        since = time.time() - days * 86400 if days else 0
+        with self._lock:
+            rows = self._db.execute(
+                'SELECT r.created, c.exit_id, c.exit_label, c.target, c.status, c.result '
+                'FROM cells c JOIN runs r ON r.id = c.run_id '
+                "WHERE r.created >= ? AND c.status NOT IN ('ok','skipped') ORDER BY r.created DESC LIMIT ?",
+                (since, int(limit))).fetchall()
+        out = []
+        for r in rows:
+            res = json.loads(r['result'])
+            st = r['status']
+            if st == 'geo_mismatch':
+                st = res.get('rawStatus') or 'fail'
+            k3 = _cls3(st, res)
+            if k3 == 'good':
+                continue
+            kind = ('nginx' if res.get('hardBlock') else 'exit_down' if st in ('exit_down', 'excluded')
+                    else 'unreachable' if not res.get('code') else 'http')
+            out.append({'at': res.get('at') or r['created'], 'target': r['target'],
+                        'exit': r['exit_label'] or r['exit_id'], 'exitIp': res.get('exitIp') or '',
+                        'exitLoc': res.get('exitLoc') or '', 'code': res.get('code') or 0, 'kind': kind,
+                        'level': k3, 'note': (res.get('symptom') or res.get('note') or res.get('error') or '')[:160]})
+        return out
+
     def close(self):
         with self._lock:
             self._db.close()

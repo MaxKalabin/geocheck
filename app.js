@@ -573,11 +573,13 @@ function detailRowHtml(r, doms, nCols) {
     const cls = cellClass(c.code, c);
     const ms = (c.ms != null && !isNaN(c.ms)) ? ` · ${(c.ms / 1000).toFixed(2)}s` : '';
     const extras = [];
+    if (c.exitIp || c.at) extras.push(`VPN ${c.exitIp ? 'IP ' + c.exitIp : ''}${c.exitLoc ? ' (' + c.exitLoc + ')' : ''}${c.at ? ' · ' + new Date(c.at * 1000).toLocaleTimeString('ru-RU') : ''}`.trim());
     if (c.code) {
       if (c.note) extras.push(c.note);
       if (c.cfRay) extras.push('cf-ray ' + c.cfRay);
       if (c.cfMitigated) extras.push('cf-mitigated: ' + c.cfMitigated);
       if (c.ip) extras.push('ip ' + c.ip);
+      
       if (c.server) extras.push(c.server);
     }
     return `<div class="dline"><span class="cell ${cls}">${esc(cellText(c.code, null, c.note, c))}</span> ${dom}${ms} · ${esc(verdict(c.code, c))}` +
