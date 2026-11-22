@@ -254,6 +254,40 @@ def _new_exit(eid, label, port, status):
             'fails': 0, 'excluded': False, 'exit_ip': '', 'exit_loc': '', 'geo': 'unknown'}
 
 
+def _nodes_path():
+    return os.path.join(DATA_DIR, 'nodes.json')
+
+
+def _load_nodes():
+    try:
+        with open(_nodes_path(), encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_nodes(reg):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _nodes_path() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(reg, f, ensure_ascii=False)
+        os.replace(tmp, _nodes_path())
+    except OSError:
+        pass
+
+
+def _node_id(label, used):
+    import hashlib
+    base = 'n' + hashlib.sha1(label.encode('utf-8')).hexdigest()[:8]
+    nid, k = base, 2
+    while nid in used:
+        nid, k = f'{base}-{k}', k + 1
+    used.add(nid)
+    return nid
+
+
 def configure(urls, inline=None):
     warnings = []
     with STATE['lock']:
@@ -287,9 +321,14 @@ def configure(urls, inline=None):
         STATE['sb_mode'] = sb_mode
         if len(proxies) > MAX_EXITS:
             warnings.append(f'нод в подписках {len(proxies)}, взято первых {MAX_EXITS} (RG_MAX_EXITS)')
+        reg = _load_nodes()
+        used_ids, seen_ids = set(), set()
         for i, p in enumerate(proxies[:MAX_EXITS]):
             port = BASE_PORT + i
             label = p.get('_name') or f'proxy-{i+1}'
+            nid = _node_id(label, used_ids)
+            seen_ids.add(nid)
+            reg[nid] = {'label': label, 'last_seen': time.time(), 'first_seen': (reg.get(nid) or {}).get('first_seen', time.time())}
             host = p.get('server', '')
             if host and not re.match(r'^\d+\.\d+\.\d+\.\d+$', host):
                 ip = resolve_ipv4(host)
@@ -297,7 +336,7 @@ def configure(urls, inline=None):
                     p['server'] = ip
                 else:
                     warnings.append(f'{label}: не удалось резолвить сервер вне tun-DNS')
-            ex = _new_exit(f'px{i}', label, port, 'запускается…')
+            ex = _new_exit(nid, label, port, 'запускается…')
             STATE['exits'].append(ex)
             if sb:
                 cfg, _ = sb_config(p, port)
@@ -309,6 +348,15 @@ def configure(urls, inline=None):
                     warnings.append(f'{label}: sing-box не запустился')
             else:
                 ex['status'] = 'нет sing-box'
+        if proxies:
+            _save_nodes(reg)
+            # пропавшие из подписки ноды остаются в списке: недоступны, статистика сохраняется
+            for nid, meta in reg.items():
+                if nid not in seen_ids:
+                    g = _new_exit(nid, meta.get('label') or nid, None, '⚠ нет в подписке — условно недоступна')
+                    g['excluded'] = True
+                    g['gone'] = True
+                    STATE['exits'].append(g)
         STATE['warnings'] = warnings
     return {'exits': public_exits(), 'warnings': warnings}
 
@@ -378,7 +426,7 @@ def kill_exit(ex):
 
 
 def public_exits():
-    keys = ('id', 'label', 'port', 'ok', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded')
+    keys = ('id', 'label', 'port', 'ok', 'status', 'exit_ip', 'exit_loc', 'claimed', 'geo', 'fails', 'excluded', 'gone')
     return [{k: e.get(k) for k in keys} for e in STATE['exits']]
 
 
@@ -428,8 +476,13 @@ def warmup():
     with STATE['lock']:
         exits = list(STATE['exits'])        # и исключённые: прогрев даёт им шанс вернуться
     with ThreadPoolExecutor(max_workers=16) as pool:
-        futs = {ex['id']: pool.submit(control_check, ex) for ex in exits}
-        return {eid: f.result() for eid, f in futs.items()}
+        futs = {ex['id']: pool.submit(control_check, ex) for ex in exits if not ex.get('gone')}
+        out = {eid: f.result() for eid, f in futs.items()}
+    for ex in exits:
+        if ex.get('gone'):
+            out[ex['id']] = {'code': 0, 'ms': None, 'ip': '', 'loc': '', 'ok': False, 'gone': True,
+                             'error': 'нет в подписке', 'fails': ex.get('fails', 0), 'excluded': True, 'geo': 'unknown'}
+    return out
 
 
 # ---------------------------------------------------------------- measurement
@@ -562,6 +615,59 @@ def _targets(raw):
 FWD_HOSTS = ('check-host.net', 'api.globalping.io')
 CTYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
           '.css': 'text/css; charset=utf-8'}
+
+
+LAST_MAX = 1_500_000
+
+
+def _last_path(kind):
+    return os.path.join(DATA_DIR, f'lastmodel_{kind}.json')
+
+
+def _is_default_model(m):
+    doms = [str(d).rstrip('/') for d in (m.get('domains') or [])]
+    return sorted(doms) == sorted(d.rstrip('/') for d in PUB_DEFAULT_TARGETS)
+
+
+def scrub_model(m):
+    """Сохранённую проверку отдаём публично без IP выходов и сырых ошибок."""
+    for g in m.get('groups', []):
+        for r in g.get('rows', []):
+            if isinstance(r.get('sub'), str):
+                r['sub'] = re.sub(r'exit [0-9a-fA-F.:]+ \(', '(', r['sub'])
+            for c in (r.get('cells') or {}).values():
+                if isinstance(c, dict):
+                    for k in ('error', 'headers', 'body'):
+                        c.pop(k, None)
+    return m
+
+
+def save_lastmodel(m, public):
+    if not isinstance(m, dict) or not isinstance(m.get('groups'), list) or not isinstance(m.get('domains'), list):
+        return False
+    raw = json.dumps(m, ensure_ascii=False)
+    if len(raw) > LAST_MAX:
+        return False
+    if public and not _is_default_model(m):
+        return False
+    kinds = ['pub'] if public else (['priv', 'pub'] if _is_default_model(m) else ['priv'])
+    for k in kinds:
+        data = raw if k == 'priv' else json.dumps(scrub_model(json.loads(raw)), ensure_ascii=False)
+        tmp = _last_path(k) + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(data)
+        os.replace(tmp, _last_path(k))
+    return True
+
+
+def load_lastmodel(kind):
+    for k in ([kind, 'pub'] if kind == 'priv' else ['pub']):
+        try:
+            with open(_last_path(k), encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 class H(BaseHTTPRequestHandler):
@@ -753,6 +859,8 @@ class H(BaseHTTPRequestHandler):
             if not job:
                 return self._json({'ok': False, 'error': 'нет такого задания'}, 404)
             return self._json({'ok': True, 'job': job.snapshot(full=True)})
+        if path == '/lastmodel':
+            return self._json({'ok': True, 'model': load_lastmodel('priv')})
         if path == '/stats':
             return self._json({'ok': True, **HISTORY.stats(_days(self.path))})
         if path == '/history':
@@ -787,6 +895,9 @@ class H(BaseHTTPRequestHandler):
                 return self._json({'ok': False, 'error': 'пустой список URL'}, 400)
             r = configure(urls, inline)
             return self._json({'ok': True, 'exits': r['exits'], 'warnings': r['warnings']})
+
+        if path == '/lastmodel':
+            return self._json({'ok': save_lastmodel(body.get('model'), False)})
 
         if path == '/exits/reset':
             return self._json({'ok': True, 'exits': reset_exits()})
@@ -920,7 +1031,9 @@ def pub_exits_legacy():
     """VPN-выходы для публичной страницы: название и страна видны, IP/порты выходов — нет."""
     out = []
     for e in STATE['exits']:
-        if e.get('ok') is None:
+        if e.get('gone'):
+            st = '⚠ нет в подписке — условно недоступна'
+        elif e.get('ok') is None:
             st = ''
         elif e.get('ok'):
             st = f"OK · страна выхода {e.get('exit_loc') or '??'}" + (' · ⚠ не совпадает с заявленной' if e.get('geo') == 'mismatch' else '')
@@ -1010,6 +1123,8 @@ class P(BaseHTTPRequestHandler):
             return self._send({'ok': True, 'version': VERSION, 'public': True})
         if path == '/status':
             return self._send({'ok': True, 'version': VERSION, 'public': True, 'exits': pub_exits_legacy()})
+        if path == '/lastmodel':
+            return self._send({'ok': True, 'model': load_lastmodel('pub')})
         if path == '/stats':
             dflt = [d.rstrip('/') for d in PUB_DEFAULT_TARGETS]
             st = HISTORY.stats(_days(self.path), only_target=lambda t, p: not p.get('public') or t.rstrip('/') in dflt)
@@ -1075,6 +1190,17 @@ class P(BaseHTTPRequestHandler):
             if not _fwd_ok(self._client()):
                 return self._send({'ok': False, 'error': 'слишком много запросов'}, 429)
             return self.fwd_request('POST')
+        if path == '/lastmodel':
+            if not _fwd_ok('lm' + self._client()):
+                return self._send({'ok': False}, 429)
+            try:
+                n = int(self.headers.get('Content-Length', '0') or 0)
+                if n > LAST_MAX:
+                    return self._send({'ok': False, 'error': 'too large'}, 413)
+                body = json.loads(self.rfile.read(n) or b'{}')
+            except Exception:
+                return self._send({'ok': False, 'error': 'bad json'}, 400)
+            return self._send({'ok': save_lastmodel(body.get('model'), True)})
         if path == '/jobs/cancel' or (path.startswith('/jobs/') and path.endswith('/cancel')):
             job = self._pub_job(path[6:-7].strip('/'))
             if not job:

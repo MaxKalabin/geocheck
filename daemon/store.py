@@ -32,6 +32,18 @@ CREATE INDEX IF NOT EXISTS cells_run ON cells(run_id);
 _DROP = ('headers', 'body')
 
 
+def _cls3(st, res):
+    """good — открылось, warn — отказ (4xx, антибот, капча), bad — обрыв, 5xx, выход не работал."""
+    if st == 'skipped':
+        return None
+    if st in ('exit_down', 'excluded'):
+        return 'bad'
+    code = res.get('code') or 0
+    if res.get('antibot') or res.get('captcha') or res.get('hardBlock') or 400 <= code < 500:
+        return 'warn'
+    return 'good' if st == 'ok' else 'bad'
+
+
 class History:
     def __init__(self, path):
         self.path = path
@@ -105,19 +117,23 @@ class History:
         last_run, last_targets = 0, set()
 
         def acc(d, key):
-            return d.setdefault(key, {'ok': 0, 'fail': 0, 'down': 0, 'ms': 0, 'msn': 0, 'last': 0})
+            return d.setdefault(key, {'ok': 0, 'fail': 0, 'down': 0, 'ms': 0, 'msn': 0, 'last': 0, 'good': 0, 'warn': 0, 'bad': 0})
         for r in rows:
             params = json.loads(r['params'] or '{}')
             if only_target and not only_target(r['target'], params):
                 continue
             res = json.loads(r['result'])
+            tkey = r['target'].rstrip('/')
             st = r['status']
             if st == 'geo_mismatch':
                 st = res.get('rawStatus') or 'fail'
             label = r['exit_label'] or r['exit_id']
-            for d, key in ((ex, label), (tg, r['target']), (mx, (r['target'], label))):
+            for d, key in ((ex, label), (tg, tkey), (mx, (tkey, label))):
                 a = acc(d, key)
                 a['last'] = max(a['last'], r['created'])
+                k3 = _cls3(st, res)
+                if k3:
+                    a[k3] += 1
                 if st == 'ok':
                     a['ok'] += 1
                     if res.get('ms'):
@@ -130,13 +146,14 @@ class History:
             if r['created'] > last_run:
                 last_run, last_targets = r['created'], set()
             if r['created'] == last_run:
-                last_targets.add(r['target'])
+                last_targets.add(tkey)
 
         def fin(a):
             n = a['ok'] + a['fail']
             return {'ok': a['ok'], 'fail': a['fail'], 'down': a['down'], 'checks': n,
                     'availability': round(100 * a['ok'] / n, 1) if n else None,
-                    'avgMs': round(a['ms'] / a['msn']) if a['msn'] else None, 'last': a['last']}
+                    'avgMs': round(a['ms'] / a['msn']) if a['msn'] else None, 'last': a['last'],
+                    'good': a['good'], 'warn': a['warn'], 'bad': a['bad'], 'total': a['good'] + a['warn'] + a['bad']}
         return {'runs': runs_total, 'days': days,
                 'exits': sorted(({'label': k, **fin(v)} for k, v in ex.items()),
                                 key=lambda x: (x['availability'] is None, -(x['availability'] or 0), x['avgMs'] or 1e9)),

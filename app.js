@@ -535,11 +535,27 @@ function wireTableEvents(t, model, allKeys) {
 }
 
 /* детали выезжают строкой ПОД нодой: одна строка на домен, код цветом результата */
+let statsCache = null, statsLoading = false;
+function loadStatsOnce() {
+  if (statsLoading || (statsCache && Date.now() - statsCache.at < 60000)) return;
+  statsLoading = true;
+  dFetch('/stats').then(r => r.json()).then(j => {
+    if (j && j.ok) { const idx = {}; (j.matrix || []).forEach(c => { idx[c.target.replace(/\/$/, '') + '\n' + c.exit] = c; }); statsCache = { at: Date.now(), idx }; }
+  }).catch(() => { }).finally(() => { statsLoading = false; if (lastModel) renderRows(lastModel); });
+}
+function statHtml(r, d) {
+  if (!r.key.startsWith('daemon:')) return '';
+  if (!statsCache) { loadStatsOnce(); return ''; }
+  const c = statsCache.idx[String(d).replace(/\/$/, '') + '\n' + r.title];
+  if (!c || !c.total) return ' · <span class="dextra">история: нет данных</span>';
+  const f = n => `${n}/${c.total} (${Math.round(100 * n / c.total)}%)`;
+  return ` · <span class="dextra">среднее за ${c.total} проверок:</span> <b class="st-g">${f(c.good)}</b> <b class="st-y">${f(c.warn)}</b> <b class="st-r">${f(c.bad)}</b>`;
+}
 function detailRowHtml(r, doms, nCols) {
   const lines = doms.map((d, di) => {
     const c = r.cells[di];
     const dom = `<b>${esc(shortDomain(d))}</b>`;
-    if (!c) return `<div class="dline"><span class="cell empty">—</span> ${dom} · нет данных</div>`;
+    if (!c) return `<div class="dline"><span class="cell empty">—</span> ${dom} · нет данных${statHtml(r, d)}</div>`;
     if (c.loading) return `<div class="dline"><span class="cell loading">…</span> ${dom} · проверяю…</div>`;
     const cls = cellClass(c.code, c);
     const ms = (c.ms != null && !isNaN(c.ms)) ? ` · ${(c.ms / 1000).toFixed(2)}s` : '';
@@ -552,7 +568,7 @@ function detailRowHtml(r, doms, nCols) {
       if (c.server) extras.push(c.server);
     }
     return `<div class="dline"><span class="cell ${cls}">${esc(cellText(c.code, null, c.note, c))}</span> ${dom}${ms} · ${esc(verdict(c.code, c))}` +
-      (extras.length ? ` · <span class="dextra">${esc(extras.join(' · '))}</span>` : '') + `</div>`;
+      (extras.length ? ` · <span class="dextra">${esc(extras.join(' · '))}</span>` : '') + statHtml(r, d) + `</div>`;
   }).join('');
   return `<tr class="detail-row" data-k="${esc(r.key)}"><td colspan="${nCols}"><div class="dbox">${lines}` +
     `<button class="btn mini" data-closedetail="${esc(r.key)}">▾ свернуть</button></div></td></tr>`;
@@ -671,12 +687,24 @@ function saveLastRun(model) {
   };
   lastAt = clean.at;
   try { localStorage.setItem(LS_LAST, JSON.stringify(clean)); } catch { }
+  dFetch('/lastmodel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: clean }) }).catch(() => { });
 }
-function restoreLastRun() {
+async function restoreServerRun() {
   try {
-    const s = JSON.parse(localStorage.getItem(LS_LAST));
+    const r = await dFetch('/lastmodel');
+    const j = await r.json();
+    const s = j && j.model;
+    if (!s || !s.groups || !(s.at > (lastAt || 0))) return;
+    const norm = a => JSON.stringify((a || []).map(x => String(x).replace(/\/$/, '')));
+    if (norm(s.domains) !== norm(settings.domains)) return;
+    restoreLastRun(s);
+  } catch { }
+}
+function restoreLastRun(given) {
+  try {
+    const s = given || JSON.parse(localStorage.getItem(LS_LAST));
     if (!s || !s.groups) return;
-    if (JSON.stringify(s.domains) !== JSON.stringify(settings.domains)) return;
+    if (!given && JSON.stringify(s.domains) !== JSON.stringify(settings.domains)) return;
     const idByTitle = { 'Локально': 'local', 'check-host.net': 'ch', 'GlobalPing': 'gp' };
     s.groups.forEach(g => { if (!g.id) g.id = idByTitle[g.title] || g.title; });
     lastModel = s;
@@ -1390,6 +1418,6 @@ document.getElementById('btnSendSubs').onclick = async () => {
   renderRows(null);
   renderHistory();
   restoreLastRun();
-  refreshDaemonState().then(() => renderRows(lastModel));
+  refreshDaemonState().then(() => renderRows(lastModel)).then(restoreServerRun);
   log('Готово. Отметьте домены и точки, нажмите «Запустить проверку».');
 })();
