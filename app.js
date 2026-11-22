@@ -881,11 +881,11 @@ async function gpPoll(id) {
   log(`GlobalPing: измерение ${id.slice(0, 8)} не завершилось за 90 с`, 'warn');
   return [];
 }
-async function daemonRun(domains) {
+async function daemonRun(domains, recheck) {
   try {
     const r = await dFetch('/jobs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domains, browser: !!settings.useBrowser, domainFirst: !!settings.domainFirst }),
+      body: JSON.stringify({ domains, browser: !!settings.useBrowser, domainFirst: !!settings.domainFirst, recheck: !!recheck }),
     });
     const j = await r.json();
     if (!j.ok) return { error: j.error || ('HTTP ' + r.status) };
@@ -934,7 +934,7 @@ async function runLocal(model, seq, diList, rowFilter) {
   if (dexits.length) {
     const tDaemon = Date.now();
     log(`демон: отправил ${diList.length} домен(ов) на прогон…`);
-    const dRes = await daemonRun(diList.map(di => model.domains[di]));
+    const dRes = await daemonRun(diList.map(di => model.domains[di]), !!rowFilter);
     if (dRes && dRes.results) {
       for (const ex of dexits) {
         const r = getRow(model, 'daemon:' + ex.id);

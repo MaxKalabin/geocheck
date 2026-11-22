@@ -174,7 +174,7 @@ def resolve_ipv4(host):
 
 
 # ---------------------------------------------------------------- curl probe
-def probe(url, port=None, capture_body=False):
+def probe(url, port=None, capture_body=False, patient=False):
     """curl-замер; port=None → системный маршрут. capture_body=True — тело в res['body'] (для GeoIP)."""
     curl = curl_bin()
     if not curl:
@@ -190,12 +190,12 @@ def probe(url, port=None, capture_body=False):
     if os.name == 'nt':
         cmd.append('--ssl-no-revoke')   # Schannel: иначе CRYPT_E_REVOCATION_OFFLINE
     cmd += ['-o', body_f if capture_body else os.devnull, '-D', hdr, '-w', fmt,
-            '--max-time', '60', '--connect-timeout', '20', '-A', UA]
+            '--max-time', '90' if patient else '60', '--connect-timeout', '60' if patient else '20', '-A', UA]
     if port:
         cmd += ['-x', f'socks5h://127.0.0.1:{port}']
     cmd += ['--', url]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=85)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=115 if patient else 85)
         out = (p.stdout or '').strip().splitlines()
         code, dns, conn, tls, ttfb, total, ip = 0, '', '', '', '', '', ''
         if out:
@@ -486,20 +486,24 @@ def warmup():
 
 
 # ---------------------------------------------------------------- measurement
-def browser_probe(url, port):
+def browser_probe(url, port, patient=False):
     """Проверка настоящим браузером (daemon/browser_probe.py): антибот-заглушка со Send, время загрузки."""
     if not re.match(r'^https?://\S+$', url or '', re.I):
         return {'code': 0, 'note': 'недопустимый URL (нужен http/https)', 'errorKind': 'other'}
     try:
+        env = dict(os.environ)
+        if patient:
+            env['GC_LOAD_TIMEOUT_MS'] = '60000'     # перепроверка: ждём ответ до 60 с
         p = subprocess.run([sys.executable, '-I', os.path.join(HERE, 'browser_probe.py'), url, str(port or '')],
-                           capture_output=True, text=True, timeout=150)
+                           capture_output=True, text=True, timeout=240 if patient else 150, env=env)
         return json.loads((p.stdout or '').strip().splitlines()[-1])
     except Exception as e:
         return {'code': 0, 'note': 'браузерный пробник не ответил', 'errorKind': 'other', 'error': str(e)[:300]}
 
 
-def _one_probe(ex, target, browser, domain_first):
-    fn = browser_probe if browser else probe
+def _one_probe(ex, target, browser, domain_first, patient=False):
+    _f = browser_probe if browser else probe
+    fn = (lambda u, port: _f(u, port, patient=True)) if patient else _f
     if domain_first:
         root = root_of(target)
         if root != target:
@@ -521,7 +525,7 @@ def _stamp(cell, ex):
     return cell
 
 
-def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms):
+def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms, patient=False):
     """Один выход × одна цель: несколько повторов, большинство побеждает."""
     if job.cancelled.is_set():
         return
@@ -529,7 +533,7 @@ def measure_cell(job, ex, target, browser, domain_first, repeats, slow_ms):
     for _ in range(repeats):
         if job.cancelled.is_set():
             return
-        res = _one_probe(ex, target, browser, domain_first)
+        res = _one_probe(ex, target, browser, domain_first, patient)
         statuses.append(cell_status(res, slow_ms if browser else None))
         reps.append(res)
     winner, stable = majority(statuses)
@@ -551,6 +555,7 @@ def run_job(job):
     p = job.params
     browser = bool(p.get('browser'))
     domain_first = bool(p.get('domainFirst'))
+    patient = bool(p.get('recheck'))     # перепроверка: таймаут ответа 60 с вместо 20 с
     default_rep = 1 if browser else REPEATS_DEFAULT
     try:
         repeats = max(1, min(3, int(p.get('repeats') or default_rep)))
@@ -593,7 +598,7 @@ def run_job(job):
                     job.record(ex['id'], t, _stamp({'code': 0, 'exitDown': True, 'status': 'exit_down',
                                              'note': 'выход не прошёл контрольную проверку — замер не учитывается'}, ex))
                 else:
-                    pool.submit(measure_cell, job, ex, t, browser, domain_first, repeats, slow_ms)
+                    pool.submit(measure_cell, job, ex, t, browser, domain_first, repeats, slow_ms, patient)
     # ждём пул (выход из with ждёт завершения задач)
 
     # 3) итог по целям
@@ -1325,7 +1330,8 @@ class P(BaseHTTPRequestHandler):
 
 def _params(body):
     return {'browser': bool(body.get('browser')), 'domainFirst': bool(body.get('domainFirst')),
-            'repeats': body.get('repeats'), 'slowMs': body.get('slowMs')}
+            'repeats': body.get('repeats'), 'slowMs': body.get('slowMs'),
+            'recheck': bool(body.get('recheck'))}
 
 
 # ---------------------------------------------------------------- startup
