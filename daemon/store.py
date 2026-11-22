@@ -39,9 +39,18 @@ def _cls3(st, res):
     if st in ('exit_down', 'excluded'):
         return 'bad'
     code = res.get('code') or 0
-    if res.get('antibot') or res.get('captcha') or res.get('hardBlock') or 400 <= code < 500:
+    ms = res.get('ms') or 0
+    if res.get('hardBlock') or res.get('captcha') == 'failed':
+        return 'bad'
+    if res.get('antibot'):                       # 503-заглушка со Send: минимум жёлтый
+        return 'bad' if ms > 30000 else 'warn'
+    if code == 0 or code >= 500:
+        return 'bad'
+    if res.get('engine') == 'browser' and ms > 30000:
+        return 'bad'
+    if 400 <= code < 500 or (res.get('engine') == 'browser' and ms > 10000):
         return 'warn'
-    return 'good' if st == 'ok' else 'bad'
+    return 'good'
 
 
 class History:

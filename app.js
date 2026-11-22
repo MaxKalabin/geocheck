@@ -65,9 +65,11 @@ function shortDomain(u) {
 }
 function normUrl(u) { u = String(u || '').trim(); return !u ? '' : (/^[a-z][a-z0-9+.-]*:\/\//i.test(u) ? u : 'https://' + u); }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+const RED_MS = 30000;   // дольше — красный; от slowMs (10 с) до этого — жёлтый
 function cellClass(code, c) {
-  if (c && c.hardBlock) return 'warn';
-  if (c && c.antibot) return c.captcha === 'failed' ? 'bad' : (c.ms > settings.slowMs ? 'warn' : 'redir');
+  if (c && c.hardBlock) return 'bad';
+  if (c && c.antibot) return (c.captcha === 'failed' || c.ms > RED_MS) ? 'bad' : 'warn';
+  if (c && c.engine === 'browser' && code && c.ms > RED_MS) return 'bad';
   if (c && c.engine === 'browser' && code && c.ms > settings.slowMs) return 'warn';
   if (!code) return 'err';
   if (code >= 200 && code < 300) return 'ok';
@@ -76,13 +78,13 @@ function cellClass(code, c) {
   if (code >= 500) return 'bad';
   return 'err';
 }
-function isFailed(c) { return !c || (!c.hardBlock && (!c.code || c.code >= 500 || (c.antibot && c.captcha === 'failed') || (c.engine === 'browser' && c.ms > settings.slowMs))); }
+function isFailed(c) { return !c || (!c.hardBlock && (!c.code || c.code >= 500 || (c.antibot && c.captcha === 'failed') || (c.engine === 'browser' && c.ms > RED_MS))); }
 function cellText(code, ms, note, c) {
-  if (c && c.hardBlock) return '⛔ nginx 503 (антибот)';
+  if (c && c.hardBlock) return '⛔ NGINX 503';
   if (c && c.antibot && c.captcha === 'failed') return '🛡 Send не прошёл';
   if (c && c.antibot) return `🛡 Send · ${((c.ms || 0) / 1000).toFixed(1)}s`;
   if (c && c.skipped) return 'домен не грузится';
-  if (c && c.engine === 'browser' && code && ms > settings.slowMs) return `${code} · медленно ${(ms / 1000).toFixed(1)}s`;
+  if (c && c.engine === 'browser' && code && ms > settings.slowMs) return `${code} · ${ms > RED_MS ? 'очень медленно' : 'медленно'} ${(ms / 1000).toFixed(1)}s`;
   if (!code) return `ERR${note ? ' · ' + note : ''}`;
   const sec = (ms == null || isNaN(ms)) ? '' : ` · ${(ms / 1000).toFixed(2)}s`;
   const tag = code === 403 ? ' ⚠CF' : '';
