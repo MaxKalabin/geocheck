@@ -87,6 +87,7 @@ tr.msg.pending td { color: var(--muted); animation: pulse 1.2s infinite; }
 .cell.redir { background: rgba(88,166,255,.13); color: var(--blue); border: 1px solid rgba(88,166,255,.4); }
 .cell.warn { background: rgba(210,153,34,.14); color: var(--orange); border: 1px solid rgba(210,153,34,.45); }
 .cell.bad { background: rgba(248,81,73,.14); color: var(--red); border: 1px solid rgba(248,81,73,.45); }
+.cell.nginx { background: rgba(163,113,247,.14); color: #a371f7; border: 1px solid rgba(163,113,247,.45); }
 .cell.err { background: rgba(110,118,129,.15); color: var(--grey); border: 1px solid rgba(110,118,129,.4); }
 .cell.loading { color: var(--muted); border: 1px dashed var(--border); background: transparent; animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: .4; } }

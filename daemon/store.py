@@ -40,7 +40,9 @@ def _cls3(st, res):
         return 'bad'
     code = res.get('code') or 0
     ms = res.get('ms') or 0
-    if res.get('hardBlock') or res.get('captcha') == 'failed':
+    if res.get('hardBlock'):                     # nginx 503 на нашей стороне: IP заблокирован, выход жив
+        return 'warn'
+    if res.get('captcha') == 'failed':
         return 'bad'
     if res.get('antibot'):                       # 503-заглушка со Send: минимум жёлтый
         return 'bad' if ms > 30000 else 'warn'

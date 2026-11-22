@@ -67,11 +67,11 @@ function normUrl(u) { u = String(u || '').trim(); return !u ? '' : (/^[a-z][a-z0
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 const RED_MS = 30000;   // дольше — красный; от slowMs (10 с) до этого — жёлтый
 function cellClass(code, c) {
-  if (c && c.hardBlock) return 'bad';
+  if (c && c.hardBlock) return 'nginx';
   if (c && c.antibot) return (c.captcha === 'failed' || c.ms > RED_MS) ? 'bad' : 'warn';
   if (c && c.engine === 'browser' && code && c.ms > RED_MS) return 'bad';
   if (c && c.engine === 'browser' && code && c.ms > settings.slowMs) return 'warn';
-  if (!code) return 'err';
+  if (!code) return 'bad';
   if (code >= 200 && code < 300) return 'ok';
   if (code >= 300 && code < 400) return 'redir';
   if (code >= 400 && code < 500) return 'warn';
@@ -80,12 +80,12 @@ function cellClass(code, c) {
 }
 function isFailed(c) { return !c || (!c.hardBlock && (!c.code || c.code >= 500 || (c.antibot && c.captcha === 'failed') || (c.engine === 'browser' && c.ms > RED_MS))); }
 function cellText(code, ms, note, c) {
-  if (c && c.hardBlock) return '⛔ NGINX 503';
+  if (c && c.hardBlock) return '🛑 NGINX 503 · IP заблокирован';
   if (c && c.antibot && c.captcha === 'failed') return '🛡 Send не прошёл';
   if (c && c.antibot) return `🛡 Send · ${((c.ms || 0) / 1000).toFixed(1)}s`;
   if (c && c.skipped) return 'домен не грузится';
   if (c && c.engine === 'browser' && code && ms > settings.slowMs) return `${code} · ${ms > RED_MS ? 'очень медленно' : 'медленно'} ${(ms / 1000).toFixed(1)}s`;
-  if (!code) return `ERR${note ? ' · ' + note : ''}`;
+  if (!code) return `⛔ НЕДОСТУПНА${note ? ' · ' + note : ''}`;
   const sec = (ms == null || isNaN(ms)) ? '' : ` · ${(ms / 1000).toFixed(2)}s`;
   const tag = code === 403 ? ' ⚠CF' : '';
   return `${code}${tag}${sec}`;
@@ -96,7 +96,7 @@ function errorOrigin(c) {
   return c.cfRay ? 'cf' : 'origin';
 }
 function verdict(code, c) {
-  if (c && c.hardBlock) return 'жёсткий антибот сайта: nginx 503 Service Temporarily Unavailable — обходить нельзя, это не заглушка со Send';
+  if (c && c.hardBlock) return 'наш сервер (nginx) отдал 503 и закрыл доступ: с этого IP слишком много подозрительной активности. Сайт и выход живы, это не недоступность — обходить нельзя';
   if (c && c.antibot) return c.captcha === 'failed' ? 'заглушка со Send: после нажатия страница не открылась' : `заглушка со Send пройдена одним нажатием: заглушка ${((c.msLanding||0)/1000).toFixed(1)}s + загрузка после Send ${((c.msAfterCaptcha||0)/1000).toFixed(1)}s = ${((c.ms||0)/1000).toFixed(1)}s`;
   if (c && c.skipped) return c.note;
   if (c && c.engine === 'browser' && !c.code) return c.note || 'страница не грузится';
@@ -315,7 +315,7 @@ function renderRows(model) {
         if (!c) { tall[di].na++; return; }
         const cls = c.loading ? 'na' : cellClass(c.code, c);
         if (cls === 'ok' || cls === 'redir') tall[di].ok++;
-        else if (cls === 'warn') tall[di].warn++;
+        else if (cls === 'warn' || cls === 'nginx') tall[di].warn++;
         else if (cls === 'na') tall[di].na++;
         else tall[di].err++;
       });
@@ -370,7 +370,7 @@ function renderRows(model) {
         if (!c) { gt[di].na++; return; }
         const cls = c.loading ? 'na' : cellClass(c.code, c);
         if (cls === 'ok' || cls === 'redir') gt[di].ok++;
-        else if (cls === 'warn') gt[di].warn++;
+        else if (cls === 'warn' || cls === 'nginx') gt[di].warn++;
         else if (cls === 'na') gt[di].na++;
         else gt[di].err++;
       });
@@ -1098,7 +1098,7 @@ function tallyModel(model) {
       if (!c || c.loading) return;
       const cls = cellClass(c.code, c);
       if (cls === 'ok' || cls === 'redir') summary.ok++;
-      else if (cls === 'warn') summary.warn++;
+      else if (cls === 'warn' || cls === 'nginx') summary.warn++;
       else summary.err++;
     });
   }
