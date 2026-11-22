@@ -1390,6 +1390,6 @@ document.getElementById('btnSendSubs').onclick = async () => {
   renderRows(null);
   renderHistory();
   restoreLastRun();
-  refreshDaemonState();
+  refreshDaemonState().then(() => renderRows(lastModel));
   log('Готово. Отметьте домены и точки, нажмите «Запустить проверку».');
 })();
