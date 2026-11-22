@@ -967,6 +967,9 @@ class P(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         return self._send(obj, code)
 
+    def _cors(self):
+        pass                      # публичная страница и демон на одном адресе
+
     fwd_request = H.fwd_request   # только check-host.net и api.globalping.io
 
     def _client(self):
