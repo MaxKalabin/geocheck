@@ -6,7 +6,7 @@ Before=geocheck.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=__HOME__/geocheck/current/deploy/firewall.sh __PORT__
+ExecStart=/bin/bash __HOME__/geocheck/current/deploy/firewall.sh __PORT__
 
 [Install]
 WantedBy=multi-user.target
